@@ -25,20 +25,21 @@ except ImportError:
 # --- 1. ROBUST DATA FETCHERS (UPDATED FOR 2025-26 SEASON) ---
 
 @st.cache_data(ttl=3600)
+import re # Add this import at the very top of your file if not there
+
+@st.cache_data(ttl=3600)
 def fetch_team_defense_stats():
     """
-    Scrapes 'Points Allowed Per Game' (PA/G) from Basketball-Reference Standings.
-    UPDATED: Now points to 2026 Season (Current).
+    Scrapes 'Points Allowed Per Game' (PA/G) from Basketball-Reference.
+    UPDATED: Removes seeding numbers like '(1)' from team names.
     """
-    # CHANGE: 2025 -> 2026
     url = "https://www.basketball-reference.com/leagues/NBA_2026.html"
     try:
-        # Read all tables on the summary page
         dfs = pd.read_html(url)
         def_map = {}
         
         for df in dfs:
-            # We look for tables that have "PA/G" (Points Allowed/Game)
+            # Look for the Standings Table (it has PA/G)
             if 'PA/G' in df.columns:
                 team_col = df.columns[0]
                 
@@ -46,7 +47,10 @@ def fetch_team_defense_stats():
                     raw_team = str(row[team_col])
                     if "Division" in raw_team: continue
                     
-                    clean_name = raw_team.replace("*", "").strip().lower()
+                    # CLEANING: Remove "*" and "(1)" seed numbers
+                    # "Boston Celtics (2)" -> "Boston Celtics"
+                    clean_name = re.sub(r'\s*\(\d+\)', '', raw_team)
+                    clean_name = clean_name.replace("*", "").strip().lower()
                     
                     try:
                         pag = float(row['PA/G'])
@@ -57,6 +61,7 @@ def fetch_team_defense_stats():
         return def_map
     except Exception as e:
         return {}
+
 
 @st.cache_data(ttl=3600)
 def fetch_active_player_stats():
