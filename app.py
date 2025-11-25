@@ -25,11 +25,17 @@ except ImportError:
 ua = UserAgent()
 def get_headers():
     return {
-        'User-Agent': ua.random,
+        'Host': 'stats.nba.com',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/117.0',
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'en-US,en;q=0.5',
         'Referer': 'https://www.nba.com/',
-        'Origin': 'https://www.nba.com/',
-        'Accept-Language': 'en-US,en;q=0.9'
+        'Origin': 'https://www.nba.com',
+        'Connection': 'keep-alive',
+        'x-nba-stats-origin': 'stats',
+        'x-nba-stats-token': 'true'
     }
+
 
 # --- 1. LIVE INDEX ---
 @st.cache_data(ttl=3600)
