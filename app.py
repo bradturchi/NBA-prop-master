@@ -8,16 +8,9 @@ from sklearn.ensemble import RandomForestRegressor
 from fake_useragent import UserAgent
 
 # --- CONFIGURATION ---
-IMPACT_DEFENDERS = {
-    'Rudy Gobert': ['C', 'F'], 'Anthony Davis': ['C', 'F'], 'Bam Adebayo': ['C', 'F', 'G'],
-    'Victor Wembanyama': ['C', 'F'], 'Joel Embiid': ['C'], 'Jarrett Allen': ['C'],
-    'Evan Mobley': ['C', 'F', 'G'], 'Giannis Antetokounmpo': ['C', 'F'], 'Draymond Green': ['C', 'F', 'G'],
-    'Jrue Holiday': ['G', 'F'], 'OG Anunoby': ['F', 'G', 'C'], 'Derrick White': ['G', 'F'],
-    'Luguentz Dort': ['G', 'F'], 'Herbert Jones': ['F', 'G'], 'Alex Caruso': ['G', 'F'],
-    'Jaden McDaniels': ['F', 'G'], 'Mikal Bridges': ['F', 'G'], 'Dillon Brooks': ['G', 'F']
-}
+# No hardcoded defenders. We scout live.
 
-st.set_page_config(page_title="NBA Prop Master Pro", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="NBA Prop Master Pro", page_icon="🧠", layout="wide")
 
 try:
     from nba_api.stats.static import players, teams
@@ -39,10 +32,10 @@ def get_headers():
         'Accept-Language': 'en-US,en;q=0.9'
     }
 
-# --- 1. TARGETED FETCHERS ---
+# --- 1. FETCHERS ---
 @st.cache_data(ttl=3600)
 def fetch_specific_team_defense(team_id):
-    """Fetches Defensive Rating for ONE specific team only"""
+    """Fetches Defensive Rating for ONE specific team"""
     try:
         time.sleep(0.2)
         stats = teamdashboardbygeneralsplits.TeamDashboardByGeneralSplits(
@@ -55,7 +48,7 @@ def fetch_specific_team_defense(team_id):
         df = stats.get_data_frames()[0]
         return df['DEF_RATING'].iloc[0]
     except:
-        return 114.5 # League average fallback
+        return 114.5 
 
 @st.cache_data(ttl=600)
 def fetch_live_injury_report():
@@ -102,7 +95,6 @@ class NBAPredictorLogic:
                     logs.append(gamelog.get_data_frames()[0])
                 except: pass
         
-        # --- STEP 2: DATA PROCESSING ---
         if logs:
             self.safe_mode = False
             df = pd.concat(logs, ignore_index=True)
@@ -216,24 +208,46 @@ class NBAPredictorLogic:
             return False, None, None
         except: return False, None, None
 
-    def check_auto_defender(self, opp_team_id, player_positions, injury_report):
+    # --- TRUE DYNAMIC SCOUTING (No Hardcoded List) ---
+    def check_dynamic_defender(self, opp_team_id, injury_report):
         try:
+            # 1. Fetch Opponent Roster Stats
             stats = leaguedashplayerstats.LeagueDashPlayerStats(
-                team_id_nullable=opp_team_id, season='2024-25', headers=get_headers(), timeout=5
+                team_id_nullable=opp_team_id, 
+                measure_type_detailed_defense='Advanced',
+                season='2024-25', 
+                headers=get_headers(), 
+                timeout=5
             )
-            roster = stats.get_data_frames()[0]['PLAYER_NAME'].tolist()
-            for defender, positions_guarded in IMPACT_DEFENDERS.items():
-                if defender in roster:
-                    if not set(player_positions).isdisjoint(positions_guarded):
-                        status = check_player_status(injury_report, defender)
-                        if "out" in status: return False, defender, "OUT"
-                        else: return True, defender, "ACTIVE"
+            df = stats.get_data_frames()[0]
+            
+            # 2. Filter for Rotation Players (>24 MPG)
+            rotation = df[df['MIN'] > 24.0].copy()
+            
+            # 3. Find Best Defender (Lowest DEF_RATING)
+            # We sort by Def Rtg to find the toughest matchup
+            best_defenders = rotation.sort_values('DEF_RATING')
+            
+            for _, row in best_defenders.iterrows():
+                def_name = row['PLAYER_NAME']
+                def_rtg = row['DEF_RATING']
+                
+                # 4. Check if Healthy
+                status = check_player_status(injury_report, def_name)
+                
+                # If they are active AND elite (< 110.0), they are a threat
+                if def_rtg < 110.0:
+                    if "out" in status: 
+                        return False, def_name, f"OUT (Rtg {def_rtg})"
+                    else: 
+                        return True, def_name, f"ACTIVE (Rtg {def_rtg})"
+                        
             return False, None, None
         except: return False, None, None
 
 # --- UI LAYOUT ---
 st.title("⚡ NBA Prop Master Pro")
-st.caption("Live Odds & Matchup Engine")
+st.caption("Auto-Scouting Enabled")
 
 if 'data' not in st.session_state: st.session_state.data = None
 
@@ -256,8 +270,9 @@ if st.button("Analyze", type="primary"):
         is_def_active = False
         def_name, def_stat = None, None
         if next_game:
-            is_def_active, def_name, def_stat = predictor.check_auto_defender(
-                next_game['opp_id'], state['pos_list'], injury_report
+            # Use the Dynamic Scout
+            is_def_active, def_name, def_stat = predictor.check_dynamic_defender(
+                next_game['opp_id'], injury_report
             )
         
         st.session_state.data = {
@@ -298,9 +313,13 @@ if st.session_state.data:
     tm_val = c1.checkbox("Boost: Teammate Out?", value=d['is_tm_out'])
     if d['is_tm_out']: c1.caption(f"ℹ️ {d['tm_name']} is {d['tm_stat']}")
     
-    def_val = c2.checkbox(f"Penalty: Lockdown?", value=d['is_def_active'])
+    # Dynamic Label
+    def_label = "Penalty: Elite Matchup?"
+    if d['def_name']: def_label = f"Penalty: {d['def_name']}?"
+        
+    def_val = c2.checkbox(def_label, value=d['is_def_active'])
     if d['def_name']: 
-        if d['is_def_active']: c2.error(f"🔒 {d['def_name']} detected")
+        if d['is_def_active']: c2.error(f"🔒 {d['def_name']} ({d['def_stat']})")
         else: c2.success(f"🔓 {d['def_name']} is OUT")
     
     tm_mod = 1.15 if tm_val else 1.0
@@ -339,5 +358,3 @@ if st.session_state.data:
             c3.markdown(f"**Edge:** :{color}[{d_dir} {abs_diff:.1f}]")
             c4.markdown(f"**Rating:** {stars}")
         st.divider()
-
-
