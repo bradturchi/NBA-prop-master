@@ -3,15 +3,25 @@ import pandas as pd
 import numpy as np
 import time
 import random
-import requests
 from datetime import datetime, timedelta
 from sklearn.ensemble import RandomForestRegressor
 from fake_useragent import UserAgent
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="NBA Prop Master Pro", page_icon="🔥", layout="wide")
+st.set_page_config(page_title="NBA Prop Master Pro", page_icon="🚀", layout="wide")
 
-# --- API SETUP ---
+# --- MAPS FOR BACKUP SCHEDULE (ESPN Slugs) ---
+TEAM_ID_TO_SLUG = {
+    1610612737: 'atl', 1610612738: 'bos', 1610612739: 'cle', 1610612740: 'no', 1610612741: 'chi',
+    1610612742: 'dal', 1610612743: 'den', 1610612744: 'gs', 1610612745: 'hou', 1610612746: 'lac',
+    1610612747: 'lal', 1610612748: 'mia', 1610612749: 'mil', 1610612750: 'min', 1610612751: 'bkn',
+    1610612752: 'ny', 1610612753: 'orl', 1610612754: 'ind', 1610612755: 'phi', 1610612756: 'phx',
+    1610612757: 'por', 1610612758: 'sac', 1610612759: 'sa', 1610612760: 'okc', 1610612761: 'tor',
+    1610612762: 'uta', 1610612763: 'mem', 1610612764: 'wsh', 1610612765: 'det', 1610612766: 'cha'
+}
+
+# Note: IMPACT_DEFENDERS list is DELETED. We use dynamic scouting.
+
 try:
     from nba_api.stats.static import players, teams
     from nba_api.stats.endpoints import (
@@ -42,28 +52,18 @@ def build_player_index():
         df = df[df['Player'] != 'Player']
         player_map = {}
         
-        # Map Abbr to IDs
-        team_map = {
-            'ATL': 1610612737, 'BOS': 1610612738, 'CLE': 1610612739, 'NOP': 1610612740, 'CHI': 1610612741,
-            'DAL': 1610612742, 'DEN': 1610612743, 'GSW': 1610612744, 'HOU': 1610612745, 'LAC': 1610612746,
-            'LAL': 1610612747, 'MIA': 1610612748, 'MIL': 1610612749, 'MIN': 1610612750, 'BKN': 1610612751,
-            'NYK': 1610612752, 'ORL': 1610612753, 'IND': 1610612754, 'PHI': 1610612755, 'PHX': 1610612756,
-            'POR': 1610612757, 'SAC': 1610612758, 'SAS': 1610612759, 'OKC': 1610612760, 'TOR': 1610612761,
-            'UTA': 1610612762, 'MEM': 1610612763, 'WAS': 1610612764, 'DET': 1610612765, 'CHA': 1610612766
-        }
-
+        # Invert map for ID lookup
+        abbr_map = {v: k for k, v in TEAM_ID_TO_SLUG.items()}
+        
         for _, row in df.iterrows():
             name = row['Player'].replace("*", "").strip().lower()
-            team_abbr = row['Tm']
             pos_raw = row['Pos']
-            
             pos_list = []
             if "PG" in pos_raw or "SG" in pos_raw: pos_list.append("G")
             if "SF" in pos_raw or "PF" in pos_raw: pos_list.append("F")
             if "C" in pos_raw: pos_list.append("C")
             
-            t_id = team_map.get(team_abbr, 0)
-            player_map[name] = {'team_id': t_id, 'pos': pos_list}
+            player_map[name] = {'pos': pos_list}
             
         return player_map
     except: return {}
@@ -72,7 +72,7 @@ def build_player_index():
 @st.cache_data(ttl=3600)
 def fetch_specific_team_defense(team_id):
     try:
-        time.sleep(0.2)
+        time.sleep(random.uniform(0.2, 0.5))
         stats = teamdashboardbygeneralsplits.TeamDashboardByGeneralSplits(
             team_id=team_id, measure_type_detailed_defense='Advanced',
             season='2024-25', headers=get_headers(), timeout=5
@@ -98,7 +98,40 @@ def check_player_status(report, name):
         if name.lower() in key: return report[key]
     return "Active"
 
-# --- 3. MODEL ---
+# --- 3. SCHEDULE BACKUP (The Fix) ---
+def fetch_schedule_backup(team_id):
+    """Scrapes ESPN if NBA API fails to find games"""
+    try:
+        slug = TEAM_ID_TO_SLUG.get(team_id, '')
+        if not slug: return None
+        
+        url = f"https://www.espn.com/nba/team/schedule/_/name/{slug}"
+        # Headers required for ESPN sometimes
+        dfs = pd.read_html(url, storage_options={'User-Agent': ua.random})
+        
+        for df in dfs:
+            if 'DATE' in df.columns and 'OPPONENT' in df.columns:
+                for _, row in df.iterrows():
+                    # Find first future game (No Result yet)
+                    if 'W' not in str(row['RESULT']) and 'L' not in str(row['RESULT']):
+                        opp_text = str(row['OPPONENT'])
+                        is_home = 'vs' in opp_text
+                        opp_clean = opp_text.replace('vs', '').replace('@', '').strip()
+                        
+                        # Map Opponent Name back to ID (Simplified for Defense lookup)
+                        # Since we can't easily map "BOS" to ID without a map, we use League Avg Defense as fallback
+                        # OR we could map slugs. For now, we prioritize finding the GAME.
+                        return {
+                            'date': datetime.now() + timedelta(days=1), # Estimate
+                            'is_home': is_home,
+                            'opp_id': 0, # 0 triggers fallback defense
+                            'opp_name': opp_clean,
+                            'opp_def_rtg': 114.5
+                        }
+        return None
+    except: return None
+
+# --- 4. MODEL ---
 @st.cache_resource
 def load_models():
     return {k: RandomForestRegressor(n_estimators=100, random_state=42) for k in ['PTS', 'REB', 'AST']}
@@ -112,9 +145,9 @@ class NBAPredictorLogic:
     def train(self, player_name):
         if API_STATUS == "Offline": return None, None
         
+        # 1. ID
         p_key = player_name.lower()
         if p_key in self.player_index:
-            t_id = self.player_index[p_key]['team_id']
             pos_list = self.player_index[p_key]['pos']
             nba_players = players.get_players()
             nba_p = next((p for p in nba_players if p['full_name'].lower() == p_key), None)
@@ -124,9 +157,9 @@ class NBAPredictorLogic:
             nba_p = next((p for p in nba_players if p['full_name'].lower() == p_key), None)
             if not nba_p: return None, "Player not found."
             p_id = nba_p['id']
-            t_id = 0 
             pos_list = ['F'] 
 
+        # 2. Logs
         with st.spinner(f"Scouting {player_name}..."):
             logs = []
             for season in ['2023-24', '2024-25']:
@@ -141,9 +174,12 @@ class NBAPredictorLogic:
             df = pd.concat(logs, ignore_index=True)
             df.columns = [c.upper() for c in df.columns]
             
-            if t_id == 0:
-                try: t_id = df['TEAM_ID'].iloc[0]
-                except: pass
+            try: t_id = df['TEAM_ID'].iloc[0]
+            except: 
+                try:
+                    prof = commonplayerinfo.CommonPlayerInfo(player_id=p_id, headers=get_headers())
+                    t_id = prof.get_data_frames()[0]['TEAM_ID'].iloc[0]
+                except: t_id = 0
 
             df['GAME_DATE'] = pd.to_datetime(df['GAME_DATE'])
             df = df.sort_values('GAME_DATE').reset_index(drop=True)
@@ -173,6 +209,7 @@ class NBAPredictorLogic:
             
             return current_state, "Success"
         else:
+            # SAFE MODE
             self.safe_mode = True
             try:
                 career = playercareerstats.PlayerCareerStats(player_id=p_id, headers=get_headers())
@@ -190,13 +227,9 @@ class NBAPredictorLogic:
             return current_state, "Safe Mode"
 
     def get_next_game(self, team_id):
-        # --- OPTIMIZED SCHEDULE FETCH ---
-        # Instead of loop, try to hit the 'scoreboard' once or rely on ESPN backup
-        
+        # 1. Try NBA API (Only for Today/Tomorrow to prevent blocking)
         today = datetime.now()
-        
-        # 1. Try NBA Scoreboard (Just for today/tomorrow to save calls)
-        for i in range(2): 
+        for i in range(2):
             d_str = (today + timedelta(days=i)).strftime('%m/%d/%Y')
             try:
                 board = scoreboardv2.ScoreboardV2(game_date=d_str, headers=get_headers(), timeout=5)
@@ -219,44 +252,8 @@ class NBAPredictorLogic:
                         return {'date': today + timedelta(days=i), 'is_home': is_home, 'opp_id': opp_id, 'opp_name': opp_name, 'opp_def_rtg': def_rtg}
             except: continue
             
-        # 2. Fallback: ESPN Schedule Scrape (Robust)
-        # If API fails/blocks or game is >2 days out
-        return self.fetch_schedule_backup(team_id)
-
-    def fetch_schedule_backup(self, team_id):
-        # Map ID to ESPN Slug
-        slug_map = {
-            1610612737: 'atl', 1610612738: 'bos', 1610612739: 'cle', 1610612740: 'no', 1610612741: 'chi',
-            1610612742: 'dal', 1610612743: 'den', 1610612744: 'gs', 1610612745: 'hou', 1610612746: 'lac',
-            1610612747: 'lal', 1610612748: 'mia', 1610612749: 'mil', 1610612750: 'min', 1610612751: 'bkn',
-            1610612752: 'ny', 1610612753: 'orl', 1610612754: 'ind', 1610612755: 'phi', 1610612756: 'phx',
-            1610612757: 'por', 1610612758: 'sac', 1610612759: 'sa', 1610612760: 'okc', 1610612761: 'tor',
-            1610612762: 'uta', 1610612763: 'mem', 1610612764: 'wsh', 1610612765: 'det', 1610612766: 'cha'
-        }
-        slug = slug_map.get(team_id, '')
-        if not slug: return None
-        
-        try:
-            url = f"https://www.espn.com/nba/team/schedule/_/name/{slug}"
-            dfs = pd.read_html(url)
-            for df in dfs:
-                if 'DATE' in df.columns and 'OPPONENT' in df.columns:
-                    for _, row in df.iterrows():
-                        # Find first non-result row (future game)
-                        if 'W' not in str(row['RESULT']) and 'L' not in str(row['RESULT']):
-                            opp_text = str(row['OPPONENT'])
-                            is_home = 'vs' in opp_text
-                            opp_clean = opp_text.replace('vs', '').replace('@', '').strip()
-                            # Return generic data if ESPN found
-                            return {
-                                'date': datetime.now() + timedelta(days=1), # Estimate
-                                'is_home': is_home,
-                                'opp_id': 0, 
-                                'opp_name': opp_clean,
-                                'opp_def_rtg': 114.5 # Fallback
-                            }
-        except: return None
-        return None
+        # 2. Fallback: ESPN Schedule Scrape
+        return fetch_schedule_backup(team_id)
 
     def check_teammates(self, team_id, my_player_name, injury_report):
         try:
@@ -276,39 +273,51 @@ class NBAPredictorLogic:
         except: return False, None, None
 
     def check_dynamic_defender(self, opp_team_id, my_positions, injury_report):
-        if opp_team_id == 0: return False, None, None, 0.0 # Skip if ID unknown
+        if opp_team_id == 0: return False, None, None, 0.0
         try:
+            # Fetch Opponent Roster
             stats = leaguedashplayerstats.LeagueDashPlayerStats(
                 team_id_nullable=opp_team_id, season='2024-25', 
                 measure_type_detailed_defense='Advanced', headers=get_headers(), timeout=5
             )
             df = stats.get_data_frames()[0]
+            
+            # Filter: Rotation (>20m) & Good Def (<112 Rtg)
             threats = df[(df['MIN'] > 20.0) & (df['DEF_RATING'] < 112.0)].sort_values('DEF_RATING')
             
             for _, row in threats.iterrows():
                 def_name = row['PLAYER_NAME']
                 def_rtg = row['DEF_RATING']
+                
+                # Check Health
                 status = check_player_status(injury_report, def_name)
                 if "out" in status: continue
                 
+                # Check Position (Dynamic Lookups)
                 def_key = def_name.lower()
-                def_pos = ['F']
+                def_pos = ['F'] # Default
                 if def_key in self.player_index:
                     def_pos = self.player_index[def_key]['pos']
                 
+                # Intersection Logic
                 common = set(my_positions).intersection(def_pos)
+                
                 if common:
+                    # Weights
                     base_pen = 0.0
-                    if def_rtg < 106.0: base_pen = 0.08
-                    elif def_rtg < 110.0: base_pen = 0.05
-                    else: base_pen = 0.03
+                    if def_rtg < 106.0: base_pen = 0.08 # Elite
+                    elif def_rtg < 110.0: base_pen = 0.05 # Good
+                    else: base_pen = 0.03 # Solid
                     
+                    # Switchability
                     if len(common) < len(my_positions):
                         match_type = "SWITCH"
                         base_pen *= 0.7 
                     else:
                         match_type = "PRIMARY"
+                        
                     return True, def_name, f"{match_type} ({def_rtg})", base_pen
+            
             return False, None, None, 0.0
         except: return False, None, None, 0.0
 
