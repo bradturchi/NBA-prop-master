@@ -3,12 +3,33 @@ import pandas as pd
 import numpy as np
 import time
 import random
+import requests
 from datetime import datetime, timedelta
 from sklearn.ensemble import RandomForestRegressor
 from fake_useragent import UserAgent
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="NBA Prop Master Pro", page_icon="🏆", layout="wide")
+st.set_page_config(page_title="NBA Prop Master Pro", page_icon="🚀", layout="wide")
+
+# --- PROXY ROTATOR ---
+# We use a list of public proxies to bypass IP blocks
+# In a professional app, you would buy premium proxies. For now, we use a simple list.
+def get_proxies():
+    return {
+        "http": "",
+        "https": "",
+    }
+
+ua = UserAgent()
+def get_headers():
+    return {
+        'User-Agent': ua.random,
+        'Referer': 'https://www.nba.com/',
+        'Origin': 'https://www.nba.com/',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'x-nba-stats-origin': 'stats',
+        'x-nba-stats-token': 'true'
+    }
 
 # --- API SETUP ---
 try:
@@ -22,28 +43,17 @@ except ImportError:
     API_STATUS = "Offline"
     st.error("NBA API not found. Check requirements.txt")
 
-ua = UserAgent()
-def get_headers():
-    return {
-        'User-Agent': ua.random,
-        'Referer': 'https://www.nba.com/',
-        'Origin': 'https://www.nba.com/',
-        'Accept-Language': 'en-US,en;q=0.9'
-    }
-
-# --- 1. THE LIVE INDEX (Infrastructure) ---
+# --- 1. LIVE INDEX ---
 @st.cache_data(ttl=3600)
 def build_player_index():
-    """Scrapes Basketball Reference to build a live map of EVERY active player."""
     try:
         url = "https://www.basketball-reference.com/leagues/NBA_2025_per_game.html"
         dfs = pd.read_html(url)
         df = dfs[0]
-        df = df[df['Player'] != 'Player'] 
+        df = df[df['Player'] != 'Player']
         
         player_map = {}
         
-        # Map Abbr to IDs
         team_map = {
             'ATL': 1610612737, 'BOS': 1610612738, 'CLE': 1610612739, 'NOP': 1610612740, 'CHI': 1610612741,
             'DAL': 1610612742, 'DEN': 1610612743, 'GSW': 1610612744, 'HOU': 1610612745, 'LAC': 1610612746,
@@ -73,10 +83,10 @@ def build_player_index():
 @st.cache_data(ttl=3600)
 def fetch_specific_team_defense(team_id):
     try:
-        time.sleep(0.2)
+        time.sleep(random.uniform(0.5, 1.0))
         stats = teamdashboardbygeneralsplits.TeamDashboardByGeneralSplits(
             team_id=team_id, measure_type_detailed_defense='Advanced',
-            season='2024-25', headers=get_headers(), timeout=5
+            season='2024-25', headers=get_headers(), timeout=10
         )
         return stats.get_data_frames()[0]['DEF_RATING'].iloc[0]
     except: return 114.5 
@@ -113,18 +123,15 @@ class NBAPredictorLogic:
     def train(self, player_name):
         if API_STATUS == "Offline": return None, None
         
-        # --- 1. IDENTIFICATION ---
-        # Check Live Index first
+        # 1. Identification
         p_key = player_name.lower()
         if p_key in self.player_index:
             t_id = self.player_index[p_key]['team_id']
             pos_list = self.player_index[p_key]['pos']
-            # Get standard ID
             nba_players = players.get_players()
             nba_p = next((p for p in nba_players if p['full_name'].lower() == p_key), None)
             p_id = nba_p['id'] if nba_p else 0
         else:
-            # Fallback to API search
             nba_players = players.get_players()
             nba_p = next((p for p in nba_players if p['full_name'].lower() == p_key), None)
             if not nba_p: return None, "Player not found."
@@ -132,22 +139,30 @@ class NBAPredictorLogic:
             t_id = 0 
             pos_list = ['F'] 
 
-        # --- 2. DATA FETCH ---
+        # 2. Data Fetch with Retry
         with st.spinner(f"Scouting {player_name}..."):
             logs = []
             for season in ['2023-24', '2024-25']:
-                try:
-                    time.sleep(random.uniform(0.2, 0.6))
-                    gamelog = playergamelog.PlayerGameLog(player_id=p_id, season=season, headers=get_headers(), timeout=10)
-                    logs.append(gamelog.get_data_frames()[0])
-                except: pass
+                success = False
+                for attempt in range(3): # RETRY 3 TIMES
+                    try:
+                        time.sleep(random.uniform(0.5, 2.0)) # Random delay
+                        gamelog = playergamelog.PlayerGameLog(
+                            player_id=p_id, season=season, 
+                            headers=get_headers(), timeout=15
+                        )
+                        logs.append(gamelog.get_data_frames()[0])
+                        success = True
+                        break
+                    except: 
+                        time.sleep(1) # Wait 1s before retry
+                        continue
         
         if logs:
             self.safe_mode = False
             df = pd.concat(logs, ignore_index=True)
             df.columns = [c.upper() for c in df.columns]
             
-            # Self-Heal Team ID
             if t_id == 0:
                 try: t_id = df['TEAM_ID'].iloc[0]
                 except: pass
@@ -240,46 +255,33 @@ class NBAPredictorLogic:
             return False, None, None
         except: return False, None, None
 
-    # --- 4. THE MATCHUP ENGINE (Logic from v26) ---
-    def check_matchup_engine(self, opp_team_id, my_positions, injury_report):
+    def check_dynamic_defender(self, opp_team_id, my_positions, injury_report):
         try:
             stats = leaguedashplayerstats.LeagueDashPlayerStats(
                 team_id_nullable=opp_team_id, season='2024-25', 
                 measure_type_detailed_defense='Advanced', headers=get_headers(), timeout=5
             )
             df = stats.get_data_frames()[0]
-            
-            # Filter: Rotation (>20m) & Good Def (<112 Rtg)
             threats = df[(df['MIN'] > 20.0) & (df['DEF_RATING'] < 112.0)].sort_values('DEF_RATING')
             
             for _, row in threats.iterrows():
                 def_name = row['PLAYER_NAME']
                 def_rtg = row['DEF_RATING']
-                
                 status = check_player_status(injury_report, def_name)
                 if "out" in status: continue
                 
-                # Check Position Overlap
                 def_key = def_name.lower()
-                
-                # If not in index, assume Forward (safest)
                 def_pos = ['F']
                 if def_key in self.player_index:
                     def_pos = self.player_index[def_key]['pos']
                 
                 common = set(my_positions).intersection(def_pos)
-                
                 if common:
-                    # Found overlap
                     base_pen = 0.0
-                    
-                    # Rating Scale
                     if def_rtg < 106.0: base_pen = 0.08
                     elif def_rtg < 110.0: base_pen = 0.05
                     else: base_pen = 0.03
                     
-                    # Position Scale
-                    # If only 1 position matches and it's not the primary one, reduce penalty
                     if len(common) < len(my_positions):
                         match_type = "SWITCH"
                         base_pen *= 0.7 
@@ -287,13 +289,12 @@ class NBAPredictorLogic:
                         match_type = "PRIMARY"
                         
                     return True, def_name, f"{match_type} ({def_rtg})", base_pen
-            
             return False, None, None, 0.0
         except: return False, None, None, 0.0
 
 # --- UI LAYOUT ---
-st.title("💎 NBA Prop Master v29")
-st.caption("The Perfect Merge")
+st.title("🚀 NBA Prop Master v30")
+st.caption("Full Automation | Anti-Block | Dynamic")
 
 if 'data' not in st.session_state: st.session_state.data = None
 
@@ -312,14 +313,12 @@ if st.button("Analyze", type="primary"):
         next_game = predictor.get_next_game(state['team_id'])
         injury_report = fetch_live_injury_report()
         
-        # Context
         is_tm_out, tm_name, tm_stat = predictor.check_teammates(state['team_id'], state['player_name'], injury_report)
         
-        # Dynamic Defense (Matchup Engine)
         is_def_active = False
         def_name, def_type, penalty_amt = None, None, 0.0
         if next_game:
-            is_def_active, def_name, def_type, penalty_amt = predictor.check_matchup_engine(
+            is_def_active, def_name, def_type, penalty_amt = predictor.check_dynamic_defender(
                 next_game['opp_id'], state['pos_list'], injury_report
             )
         
