@@ -101,7 +101,7 @@ def normalize_abbrev(abbrev):
 
 def get_espn_schedule(my_team_abbrev):
     """
-    Finds games using a 'Fuzzy Search' and robust Time Parsing.
+    Finds games and aggressively matches defensive stats.
     """
     # 1. Setup Search Terms
     raw_abbrev = my_team_abbrev.upper().strip()
@@ -123,48 +123,61 @@ def get_espn_schedule(my_team_abbrev):
     date_str = f"{today.strftime('%Y%m%d')}-{end_date.strftime('%Y%m%d')}"
     url = f"https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard?dates={date_str}&limit=100"
     
-    debug_games_found = [] 
-    
     try:
         r = requests.get(url, timeout=5)
         data = r.json()
         def_map = fetch_espn_defense_map()
         
+        # --- DEBUG: Show us the data if it's missing ---
+        if not def_map:
+            st.sidebar.error("⚠️ Defense Map is empty! Check fetch_espn_defense_map.")
+        
         for event in data.get('events', []):
-            short_name = event.get('name', 'Unknown')
-            debug_games_found.append(short_name) 
-            
             comp = event['competitions'][0]
             competitors = comp['competitors']
             
-            # We check both teams in the matchup
             for i, team_data in enumerate(competitors):
                 team = team_data['team']
                 t_abbrev = team.get('abbreviation', '').upper()
                 t_name = team.get('displayName', '').upper()
                 
-                # --- THE FUZZY MATCH ---
+                # Fuzzy Match Team
                 is_match = (t_abbrev == espn_abbrev) or (nickname in t_name)
                 
                 if is_match:
-                    # --- FIX: ROBUST TIME PARSING ---
-                    # ESPN sends '2025-11-26T22:00Z' (no seconds) or '...:00Z' (with seconds)
+                    # Parse Date
                     d_str = comp['date'].replace('Z', '')
-                    try:
-                        # Try with seconds first
-                        date_obj = datetime.strptime(d_str, "%Y-%m-%dT%H:%M:%S")
-                    except ValueError:
-                        # Fallback to no seconds
-                        date_obj = datetime.strptime(d_str, "%Y-%m-%dT%H:%M")
+                    try: date_obj = datetime.strptime(d_str, "%Y-%m-%dT%H:%M:%S")
+                    except ValueError: date_obj = datetime.strptime(d_str, "%Y-%m-%dT%H:%M")
 
                     if date_obj.date() < datetime.now().date(): continue 
 
                     is_home = (team_data['homeAway'] == 'home')
                     opp_idx = 1 - i
                     opp_team = competitors[opp_idx]['team']
-                    opp_name = opp_team.get('displayName', 'Unknown')
                     
-                    opp_ppg = def_map.get(opp_name.lower(), 114.5)
+                    # --- SMART LOOKUP FOR DEFENSE ---
+                    opp_name = opp_team.get('displayName', 'Unknown')
+                    opp_short = opp_team.get('shortDisplayName', '').lower()
+                    opp_abbrev = opp_team.get('abbreviation', '').lower()
+                    
+                    # Try 1: Full Name ("boston celtics")
+                    opp_ppg = def_map.get(opp_name.lower())
+                    
+                    # Try 2: Short Name ("celtics")
+                    if not opp_ppg:
+                        opp_ppg = def_map.get(opp_short)
+                        
+                    # Try 3: Last Word ("celtics")
+                    if not opp_ppg:
+                        opp_ppg = def_map.get(opp_name.split()[-1].lower())
+                        
+                    # Try 4: Abbreviation ("bos")
+                    if not opp_ppg:
+                        opp_ppg = def_map.get(opp_abbrev)
+
+                    # Final Fallback
+                    if not opp_ppg: opp_ppg = 114.5
                     
                     return {
                         'date': date_obj,
@@ -175,13 +188,9 @@ def get_espn_schedule(my_team_abbrev):
                     
     except Exception as e:
         st.error(f"ESPN Error: {e}")
-    
-    with st.expander(f"🕵️ Debug: Why didn't we find {espn_abbrev}?"):
-        st.write(f"Searching for: **{espn_abbrev}** or **{nickname}**")
-        st.write("Games found in ESPN feed:")
-        st.write(debug_games_found)
         
     return None
+
 
 
 
