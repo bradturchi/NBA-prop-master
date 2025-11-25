@@ -3,25 +3,24 @@ import pandas as pd
 import numpy as np
 import time
 import random
+import requests
 from datetime import datetime, timedelta
 from sklearn.ensemble import RandomForestRegressor
 from fake_useragent import UserAgent
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="NBA Prop Master Pro", page_icon="🚀", layout="wide")
+st.set_page_config(page_title="NBA Prop Master Mobile", page_icon="📱", layout="wide")
 
 # --- API & IMPORTS ---
 try:
     from nba_api.stats.static import players, teams
-    from nba_api.stats.endpoints import (
-        playergamelog, leaguedashplayerstats, 
-        teamdashboardbygeneralsplits, playercareerstats
-    )
+    from nba_api.stats.endpoints import playergamelog, playercareerstats
     API_STATUS = "Online"
 except ImportError:
     API_STATUS = "Offline"
     st.error("NBA API not found. Please run: pip install nba_api")
 
+# --- STRONG HEADERS (To reduce blocking) ---
 ua = UserAgent()
 def get_headers():
     return {
@@ -36,80 +35,98 @@ def get_headers():
         'x-nba-stats-token': 'true'
     }
 
+# --- 1. ESPN FETCHERS (Bypasses NBA Blocks) ---
 
-# --- 1. LIVE INDEX ---
 @st.cache_data(ttl=3600)
-def build_player_index():
+def fetch_espn_defense_map():
+    """
+    Fetches 'Points Allowed Per Game' (PPG) from ESPN.
+    Reliable and Mobile-Friendly.
+    """
+    url = "https://site.api.espn.com/apis/v2/sports/basketball/nba/standings"
     try:
-        url = "https://www.basketball-reference.com/leagues/NBA_2025_per_game.html"
-        dfs = pd.read_html(url)
-        df = dfs[0]
-        df = df[df['Player'] != 'Player']
-        player_map = {}
+        r = requests.get(url, timeout=5)
+        data = r.json()
+        def_map = {}
         
-        for _, row in df.iterrows():
-            name = row['Player'].replace("*", "").strip().lower()
-            pos_raw = row['Pos']
-            pos_list = []
-            if "PG" in pos_raw or "SG" in pos_raw: pos_list.append("G")
-            if "SF" in pos_raw or "PF" in pos_raw: pos_list.append("F")
-            if "C" in pos_raw: pos_list.append("C")
-            
-            player_map[name] = {'pos': pos_list}
-            
-        return player_map
+        # Parse nested ESPN structure
+        for conference in data.get('children', []):
+            for division in conference.get('children', []):
+                for team_entry in division.get('teams', []):
+                    team = team_entry.get('team', {})
+                    name = team.get('displayName', '').lower()
+                    
+                    stats = team_entry.get('stats', [])
+                    pa, gp = 0, 1
+                    
+                    for s in stats:
+                        if s['name'] == 'pointsAgainst': pa = float(s['value'])
+                        if s['name'] == 'gamesPlayed': gp = float(s['value'])
+                            
+                    if gp > 0:
+                        avg_pa = pa / gp
+                        def_map[name] = avg_pa
+                        # Short name map (e.g. "celtics")
+                        def_map[team.get('shortDisplayName', '').lower()] = avg_pa
+                        
+        return def_map
     except: return {}
 
-# --- 2. FETCHERS ---
-@st.cache_data(ttl=3600)
-def fetch_specific_team_defense(team_id):
+def get_espn_schedule(my_team_name):
+    """
+    Finds the next game using ESPN's public scoreboard.
+    """
+    # 1. Setup Dates (Today -> +7 Days)
+    today = datetime.now()
+    end_date = today + timedelta(days=7)
+    date_str = f"{today.strftime('%Y%m%d')}-{end_date.strftime('%Y%m%d')}"
+    
+    url = f"https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard?dates={date_str}&limit=100"
+    
     try:
-        time.sleep(random.uniform(0.2, 0.5))
-        stats = teamdashboardbygeneralsplits.TeamDashboardByGeneralSplits(
-            team_id=team_id, measure_type_detailed_defense='Advanced',
-            season='2024-25', headers=get_headers(), timeout=5
-        )
-        return stats.get_data_frames()[0]['DEF_RATING'].iloc[0]
-    except: return 114.5 
+        r = requests.get(url, timeout=5)
+        data = r.json()
+        
+        # Get Defense Data
+        def_map = fetch_espn_defense_map()
+        
+        my_short = my_team_name.split()[-1].lower() # "celtics"
 
-@st.cache_data(ttl=600)
-def fetch_live_injury_report():
-    try:
-        dfs = pd.read_html("https://www.cbssports.com/nba/injuries/")
-        combined = pd.concat(dfs, ignore_index=True)
-        report = {}
-        if 'Player' in combined.columns and 'Status' in combined.columns:
-            for _, row in combined.iterrows():
-                name = str(row['Player']).split(" • ")[0].strip().lower()
-                report[name] = str(row['Status']).lower()
-        return report
-    except: return {}
+        for event in data.get('events', []):
+            short_name = event['name'].lower()
+            
+            # Simple match
+            if my_short in short_name:
+                comp = event['competitions'][0]
+                date_obj = datetime.strptime(comp['date'], "%Y-%m-%dT%H:%M:%SZ")
+                
+                # Filter Past Games (ESPN sometimes returns yesterday if late)
+                if date_obj.date() < datetime.now().date(): continue
 
-def check_player_status(report, name):
-    for key in report:
-        if name.lower() in key: return report[key]
-    return "Active"
+                competitors = comp['competitors']
+                home_comp = next(c for c in competitors if c['homeAway'] == 'home')
+                away_comp = next(c for c in competitors if c['homeAway'] == 'away')
+                
+                is_home = (my_short in home_comp['team']['displayName'].lower())
+                opp_comp = away_comp if is_home else home_comp
+                opp_name = opp_comp['team']['displayName']
+                
+                # Get Opponent PPG Allowed (Default to 114.5 if missing)
+                opp_ppg = def_map.get(opp_name.lower(), def_map.get(opp_name.split()[-1].lower(), 114.5))
+                
+                return {
+                    'date': date_obj,
+                    'is_home': 1 if is_home else 0,
+                    'opp_name': opp_name,
+                    'opp_ppg': opp_ppg 
+                }
+    except Exception as e:
+        st.error(f"ESPN Connection Error: {e}")
+        
+    return None
 
-# --- 3. SCHEDULE HELPERS (NEW) ---
-@st.cache_data
-def get_team_map():
-    """Creates a dictionary mapping Team Names to NBA API IDs."""
-    nba_teams = teams.get_teams()
-    # Maps "Boston Celtics" -> 1610612738
-    return {t['full_name'].lower(): t['id'] for t in nba_teams}
+# --- 2. LOGIC CLASS ---
 
-@st.cache_data
-def load_schedule():
-    """Loads the hardcoded schedule from CSV."""
-    try:
-        # Expects a file named 'nba_schedule_2025.csv' with columns: Date, Visitor, Home
-        df = pd.read_csv("nba_schedule_2025.csv")
-        df['Date'] = pd.to_datetime(df['Date'])
-        return df
-    except FileNotFoundError:
-        return pd.DataFrame()
-
-# --- 4. MODELS & LOGIC ---
 @st.cache_resource
 def load_models():
     return {k: RandomForestRegressor(n_estimators=100, random_state=42) for k in ['PTS', 'REB', 'AST']}
@@ -117,7 +134,6 @@ def load_models():
 class NBAPredictorLogic:
     def __init__(self):
         self.models = load_models()
-        self.player_index = build_player_index()
         self.safe_mode = False
     
     def train(self, player_name):
@@ -131,15 +147,12 @@ class NBAPredictorLogic:
         if not nba_p: return None, "Player not found."
         p_id = nba_p['id']
         
-        # Get Position from index or fallback
-        pos_list = self.player_index.get(p_key, {}).get('pos', ['F'])
-
-        # 2. Get Recent Logs (Last 2 Seasons)
+        # 2. Get Recent Logs (Try/Except for Blocking)
         logs = []
-        for _ in range(3):
+        for _ in range(2): # 2 Retries
             try:
                 for season in ['2023-24', '2024-25']:
-                    time.sleep(random.uniform(0.5, 0.8)) 
+                    time.sleep(random.uniform(0.6, 1.2)) # Slow down to avoid blocks
                     gamelog = playergamelog.PlayerGameLog(player_id=p_id, season=season, headers=get_headers(), timeout=10)
                     logs.append(gamelog.get_data_frames()[0])
                 break 
@@ -147,18 +160,26 @@ class NBAPredictorLogic:
                 time.sleep(1)
                 continue
 
-        # 3. SUCCESS PATH
+        # 3. SUCCESS PATH (Game Logs Found)
         if logs and not any(l.empty for l in logs):
             self.safe_mode = False
             df = pd.concat(logs, ignore_index=True)
             df.columns = [c.upper() for c in df.columns]
             
-            try: t_id = df['TEAM_ID'].iloc[0]
-            except: t_id = 0
+            # Identify Team Name for Schedule Lookup
+            try: 
+                # NBA API returns "BOS", we need to map to full name if possible, or just grab from user input context later
+                # We will just fetch team name from the static players/teams list
+                t_id = df['TEAM_ID'].iloc[0]
+                t_info = teams.find_team_name_by_id(t_id)
+                team_full_name = t_info['full_name']
+            except: 
+                team_full_name = "Unknown"
 
             df['GAME_DATE'] = pd.to_datetime(df['GAME_DATE'])
             df = df.sort_values('GAME_DATE').reset_index(drop=True)
             
+            # Features
             df['days_rest'] = df['GAME_DATE'].diff().dt.days - 1
             df['days_rest'] = df['days_rest'].fillna(3).clip(0, 7)
             df['is_home'] = df['MATCHUP'].apply(lambda x: 1 if 'vs.' in x else 0)
@@ -169,29 +190,32 @@ class NBAPredictorLogic:
             
             df['prev_game_min'] = df['MIN'].shift(1).fillna(32)
             
+            # Rolling Averages
             current_avgs = {}
             for stat in ['PTS', 'REB', 'AST']:
                 df[f'season_avg_{stat}'] = df[stat].expanding().mean().shift(1).fillna(df[stat].mean())
                 current_avgs[stat] = df[stat].tail(10).mean()
 
+            # Train Models
             clean_df = df.dropna()
-            clean_df['opponent_def_rating'] = 114.5 
+            # We use a placeholder for opp_rating in training since historical ESPN data isn't easily mapped
+            clean_df['opponent_rating'] = 114.5 
             
             for stat in ['PTS', 'REB', 'AST']:
-                features = ['days_rest', 'is_home', 'prev_game_min', f'season_avg_{stat}', 'opponent_def_rating']
+                features = ['days_rest', 'is_home', 'prev_game_min', f'season_avg_{stat}', 'opponent_rating']
                 if not clean_df.empty:
                     self.models[stat].fit(clean_df[features], clean_df[stat])
 
             current_state = {
-                'player_id': p_id, 'team_id': t_id, 
-                'player_name': nba_p['full_name'], 'pos_list': pos_list,
+                'player_name': nba_p['full_name'],
+                'team_full_name': team_full_name,
                 'last_date': df['GAME_DATE'].iloc[-1], 
                 'last_min': df['MIN'].iloc[-1],
                 'avgs': current_avgs
             }
             return current_state, "Success"
 
-        # 4. SAFE MODE
+        # 4. SAFE MODE (Fallback if Player Stats are blocked)
         else:
             self.safe_mode = True
             try:
@@ -200,147 +224,26 @@ class NBAPredictorLogic:
                 
                 gp = df['GP'] if df['GP'] > 0 else 1
                 avgs = {'PTS': df['PTS']/gp, 'REB': df['REB']/gp, 'AST': df['AST']/gp}
+                
+                # Try to guess team
                 t_id = df['TEAM_ID']
+                t_info = teams.find_team_name_by_id(t_id)
+                team_full_name = t_info['full_name']
                 
                 current_state = {
-                    'player_id': p_id, 'team_id': t_id,
-                    'player_name': nba_p['full_name'], 'pos_list': pos_list,
+                    'player_name': nba_p['full_name'],
+                    'team_full_name': team_full_name,
                     'last_date': datetime.now(), 
                     'last_min': 32.0, 
                     'avgs': avgs
                 }
                 return current_state, "Safe Mode"
             except Exception as e:
-                return None, f"All APIs Blocked. Try running locally. ({str(e)})"
+                return None, f"Player Stats Blocked. ({str(e)})"
 
-    def get_next_game(self, team_id):
-        """
-        Scans the local CSV schedule (Robust).
-        Then uses API only for the Opponent's defensive stats (Dynamic).
-        """
-        schedule = load_schedule()
-        if schedule.empty:
-            st.error("❌ Schedule file 'nba_schedule_2025.csv' not found.")
-            return None
-
-        # Get the team name for the ID we are searching for (e.g., 1610612738 -> "Boston Celtics")
-        all_teams = teams.get_teams()
-        my_team_info = next((t for t in all_teams if t['id'] == team_id), None)
-        if not my_team_info: return None
-        
-        my_team_name = my_team_info['full_name'].lower()
-        
-        # Filter schedule for games in the next 7 days
-        today = pd.Timestamp.now().normalize()
-        end_date = today + pd.Timedelta(days=7)
-        
-        # Normalize strings for comparison
-        schedule['Visitor'] = schedule['Visitor'].astype(str).str.lower()
-        schedule['Home'] = schedule['Home'].astype(str).str.lower()
-        
-        # Find relevant games
-        mask = (
-            (schedule['Date'] >= today) & 
-            (schedule['Date'] <= end_date) & 
-            ((schedule['Visitor'] == my_team_name) | (schedule['Home'] == my_team_name))
-        )
-        
-        upcoming_games = schedule[mask].sort_values('Date')
-        
-        if upcoming_games.empty: return None
-        
-        # Pick the first game
-        game = upcoming_games.iloc[0]
-        
-        # Determine Opponent
-        is_home = (game['Home'] == my_team_name)
-        opp_name_str = game['Visitor'] if is_home else game['Home']
-        
-        # Map Opponent Name back to ID (Critical for Dynamic Defender logic)
-        team_map = get_team_map()
-        opp_id = team_map.get(opp_name_str, 0)
-        
-        # Fetch REAL TIME Opponent Defense (This keeps it dynamic!)
-        def_rtg = fetch_specific_team_defense(opp_id)
-        
-        display_opp_name = opp_name_str.title()
-
-        return {
-            'date': game['Date'],
-            'is_home': 1 if is_home else 0,
-            'opp_id': opp_id,
-            'opp_name': display_opp_name,
-            'opp_def_rtg': def_rtg
-        }
-
-    def check_teammates(self, team_id, my_player_name, injury_report):
-        try:
-            stats = leaguedashplayerstats.LeagueDashPlayerStats(team_id_nullable=team_id, season='2024-25', headers=get_headers(), timeout=5)
-            df = stats.get_data_frames()[0]
-            top_scorers = df.sort_values('PTS', ascending=False).head(4)
-            
-            for _, row in top_scorers.iterrows():
-                if row['PLAYER_NAME'].lower() != my_player_name.lower():
-                    status = check_player_status(injury_report, row['PLAYER_NAME'])
-                    if "out" in status or "injured" in status:
-                        return True, row['PLAYER_NAME'], status
-            return False, None, None
-        except: return False, None, None
-
-    def check_dynamic_defender(self, opp_team_id, my_positions, injury_report):
-        if opp_team_id == 0: return False, None, None, 0.0
-        try:
-            # Get Opponent Roster Stats
-            stats = leaguedashplayerstats.LeagueDashPlayerStats(
-                team_id_nullable=opp_team_id, season='2024-25', 
-                measure_type_detailed_defense='Advanced', headers=get_headers(), timeout=5
-            )
-            df = stats.get_data_frames()[0]
-            
-            # Filter: Regular rotation players (>24 mins)
-            rotation_players = df[df['MIN'] > 20.0].sort_values('DEF_RATING', ascending=True)
-            
-            best_match = None
-            
-            for _, row in rotation_players.iterrows():
-                def_name = row['PLAYER_NAME']
-                def_rtg = row['DEF_RATING']
-                
-                status = check_player_status(injury_report, def_name)
-                if "out" in status: continue
-                
-                def_key = def_name.lower()
-                def_pos_list = self.player_index.get(def_key, {}).get('pos', ['F'])
-                
-                # INTERSECTION LOGIC
-                common_pos = set(my_positions).intersection(def_pos_list)
-                is_match = False
-                match_type = ""
-                
-                if common_pos:
-                    if len(common_pos) >= len(my_positions): 
-                        match_type = "PRIMARY" 
-                    else: 
-                        match_type = "SWITCH" 
-                    is_match = True
-                
-                if is_match and def_rtg < 112.0:
-                    best_match = (def_name, match_type, def_rtg)
-                    break
-            
-            if best_match:
-                name, m_type, rtg = best_match
-                # Calculate Penalty
-                base_pen = 0.10 if rtg < 108.0 else 0.05
-                if m_type == "SWITCH": base_pen *= 0.6
-                return True, name, f"{m_type} ({rtg:.1f})", base_pen
-                
-            return False, None, None, 0.0
-        except: return False, None, None, 0.0
-
-# --- 5. UI LAYOUT ---
-st.title("NBA Prop Master")
-st.caption("Scragglys betting buddy")
+# --- 3. UI LAYOUT ---
+st.title("📱 NBA Prop Master")
+st.caption("Powered by ESPN Data Feed")
 
 if 'data' not in st.session_state: st.session_state.data = None
 
@@ -350,35 +253,22 @@ if st.button("Analyze", type="primary"):
     if not player_name: st.warning("Enter name."); st.stop()
     
     predictor = NBAPredictorLogic()
-    state, msg = predictor.train(player_name)
+    
+    with st.spinner("Fetching Player Stats..."):
+        state, msg = predictor.train(player_name)
     
     if not state: st.error(msg)
     else:
-        if msg == "Safe Mode": st.warning("⚠️ API Busy: Using Safe Mode (Base Stats Only)")
+        if msg == "Safe Mode": st.warning("⚠️ Using Season Averages (Live Logs Blocked)")
         
-        with st.spinner("Checking Schedule..."):
-            next_game = predictor.get_next_game(state['team_id'])
+        with st.spinner("Checking ESPN Schedule..."):
+            next_game = get_espn_schedule(state['team_full_name'])
         
         if not next_game:
-            st.error(f"No games scheduled for {state['player_name']} in the next 7 days.")
+            st.error(f"No games found for {state['team_full_name']} in next 7 days.")
         else:
-            injury_report = fetch_live_injury_report()
-            
-            is_tm_out, tm_name, tm_stat = predictor.check_teammates(state['team_id'], state['player_name'], injury_report)
-            
-            is_def_active = False
-            def_name, def_type, penalty_amt = None, None, 0.0
-            
-            with st.spinner("Scouting Defense..."):
-                is_def_active, def_name, def_type, penalty_amt = predictor.check_dynamic_defender(
-                    next_game['opp_id'], state['pos_list'], injury_report
-                )
-            
             st.session_state.data = {
                 'state': state, 'next_game': next_game,
-                'is_tm_out': is_tm_out, 'tm_name': tm_name, 'tm_stat': tm_stat,
-                'is_def_active': is_def_active, 'def_name': def_name, 
-                'def_type': def_type, 'penalty_amt': penalty_amt,
                 'predictor': predictor, 'safe_mode': predictor.safe_mode
             }
 
@@ -388,68 +278,67 @@ if st.session_state.data:
     next_game = d['next_game']
     predictor = d['predictor']
 
-    if not next_game: 
-        st.warning("No upcoming games found."); st.stop()
-
+    # Date/Rest Logic
+    game_date = next_game['date'].strftime("%a %b %d")
     raw_rest = (next_game['date'] - state['last_date']).days - 1
     days_rest = 3 if raw_rest > 7 or raw_rest < 0 else raw_rest
     
-    opp_rating = next_game['opp_def_rtg']
-    if opp_rating < 110: def_color = "red"
-    elif opp_rating > 118: def_color = "green"
+    # DEFENSE LOGIC (Points Allowed)
+    opp_ppg = next_game['opp_ppg']
+    
+    # Color Logic: High PPG Allowed = GREEN (Good for Over)
+    if opp_ppg > 118: def_color = "green" # Easy matchup
+    elif opp_ppg < 110: def_color = "red" # Hard matchup
     else: def_color = "gray"
 
+    # --- TOP METRICS ---
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Opponent", next_game['opp_name'])
-    c2.metric("Def Rtg", f"{opp_rating:.1f}", delta=f"{114.5 - opp_rating:.1f}", delta_color="inverse")
-    c3.metric("Rest", f"{days_rest}", delta="Fresh" if days_rest > 1 else "Tired")
-    c4.metric("Pos", "/".join(state['pos_list']))
+    c1.metric("Opponent", next_game['opp_name'], delta=game_date, delta_color="off")
+    c2.metric("Opp PPG", f"{opp_ppg:.1f}", delta="Allowed", delta_color="off") 
+    # Visual Hack: Show if defense is soft or hard
+    if def_color == "green": c2.success("Soft Def")
+    elif def_color == "red": c2.error("Tough Def")
+    
+    c3.metric("Rest Days", f"{days_rest}", delta="Fresh" if days_rest > 1 else "Tired")
+    c4.metric("Location", "Home" if next_game['is_home'] else "Away")
 
     st.divider()
     
-    st.subheader("⚙️ Matchup Context")
-    c1, c2 = st.columns(2)
-    
-    tm_val = c1.checkbox("Boost: Teammate Out?", value=d['is_tm_out'])
-    if d['is_tm_out']: c1.caption(f"ℹ️ {d['tm_name']} is {d['tm_stat']}")
-    
-    def_label = "Penalty: Matchup?"
-    if d['def_name']: def_label = f"Penalty: {d['def_name']}?"
-    
-    def_val = c2.checkbox(def_label, value=d['is_def_active'])
-    if d['def_name']:
-        if d['is_def_active']: c2.error(f"🔒 {d['def_name']} ({d['def_type']})")
-        else: c2.success(f"🔓 {d['def_name']} is OUT")
-    else: c2.caption("No elite positional defender found.")
-    
-    tm_mod = 1.15 if tm_val else 1.0
-    def_mod = (1.0 - d['penalty_amt']) if def_val else 1.0
-
-    st.divider()
-    
+    # --- PROJECTIONS ---
     st.subheader("🎯 Betting Recommendations")
+    
+    # Calculate Impact based on PPG
+    # 114.5 is average. 
+    # If Opp allows 120, that's +5.5 points better context (approx +4.8% boost)
+    def_impact = (opp_ppg - 114.5) / 114.5 
+    
     for stat in ['PTS', 'REB', 'AST']:
         if d['safe_mode']:
-            pred = state['avgs'][stat] * tm_mod * def_mod
+            # Simple Logic for Safe Mode
+            base = state['avgs'][stat]
+            # Defense Mod: If they allow 5% more points, expect 5% more stats
+            pred = base * (1 + def_impact)
             if days_rest == 0: pred *= 0.95
-            if opp_rating < 110: pred *= 0.95
-            if opp_rating > 118: pred *= 1.05
         else:
-            inputs = [[days_rest, next_game['is_home'], state['last_min'], state['avgs'][stat], opp_rating]]
+            # Random Forest Logic
+            # We treat Opp PPG as the rating
+            inputs = [[days_rest, next_game['is_home'], state['last_min'], state['avgs'][stat], opp_ppg]]
             base = predictor.models[stat].predict(inputs)[0]
-            pred = base * tm_mod * def_mod
+            pred = base # RF already learned from the rating
         
         with st.container():
             c1, c2, c3, c4 = st.columns([1, 1, 2, 2])
             c1.markdown(f"### {stat}")
             c1.caption(f"Proj: {pred:.1f}")
-            line = c2.number_input(f"{stat} Line", value=float(round(state['avgs'][stat])), step=0.5, key=f"line_{stat}")
+            
+            line = c2.number_input(f"Line", value=float(round(state['avgs'][stat])), step=0.5, key=f"line_{stat}")
             diff = pred - line
             
             if diff > 0: d_dir, color = "OVER", "green"
             else: d_dir, color = "UNDER", "red"
             
             abs_diff = abs(diff)
+            # Star Rating System
             if abs_diff > (line * 0.12): stars = "⭐⭐⭐⭐⭐"
             elif abs_diff > (line * 0.08): stars = "⭐⭐⭐"
             elif abs_diff > (line * 0.04): stars = "⭐"
