@@ -87,51 +87,96 @@ def fetch_active_player_stats():
         print(f"Bball Ref Scraping Error: {e}")
         return {}
 
+# --- ROBUST SCHEDULE ENGINE ---
+
+# Map Basketball-Reference abbreviations (Left) to ESPN abbreviations (Right)
+ABBREV_MAP = {
+    'CHO': 'CHA', 'PHO': 'PHX', 'BRK': 'BKN', 'NOP': 'NO', 'SAS': 'SA', 'UTA': 'UTAH', 'WAS': 'WSH'
+}
+
+def normalize_abbrev(abbrev):
+    """Standardizes abbreviations between data sources."""
+    clean = abbrev.upper().strip()
+    return ABBREV_MAP.get(clean, clean)
+
 def get_espn_schedule(my_team_abbrev):
-    """Finds next game using ESPN. Matches via Abbreviation (e.g. BOS)."""
+    """
+    Finds games using a 'Fuzzy Search' to match BOS, Boston, or Celtics.
+    """
+    # 1. Setup Search Terms
+    raw_abbrev = my_team_abbrev.upper().strip()
+    espn_abbrev = normalize_abbrev(raw_abbrev)
+    
+    # Common nicknames to ensure we find matches
+    NICKNAMES = {
+        'BOS': 'CELTICS', 'LAL': 'LAKERS', 'LAC': 'CLIPPERS', 'PHI': '76ERS', 'MIA': 'HEAT',
+        'MIL': 'BUCKS', 'CHI': 'BULLS', 'TOR': 'RAPTORS', 'NYK': 'KNICKS', 'BKN': 'NETS',
+        'CLE': 'CAVALIERS', 'IND': 'PACERS', 'DET': 'PISTONS', 'ORL': 'MAGIC', 'ATL': 'HAWKS',
+        'CHA': 'HORNETS', 'WAS': 'WIZARDS', 'MIN': 'TIMBERWOLVES', 'DEN': 'NUGGETS', 'OKC': 'THUNDER',
+        'POR': 'TRAIL BLAZERS', 'UTA': 'JAZZ', 'GSW': 'WARRIORS', 'SAC': 'KINGS', 'PHX': 'SUNS',
+        'SAS': 'SPURS', 'HOU': 'ROCKETS', 'DAL': 'MAVERICKS', 'MEM': 'GRIZZLIES', 'NOP': 'PELICANS'
+    }
+    nickname = NICKNAMES.get(espn_abbrev, "UNKNOWN_NICKNAME")
+
+    # 2. Fetch Data
     today = datetime.now()
     end_date = today + timedelta(days=7)
     date_str = f"{today.strftime('%Y%m%d')}-{end_date.strftime('%Y%m%d')}"
     url = f"https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard?dates={date_str}&limit=100"
+    
+    debug_games_found = [] 
     
     try:
         r = requests.get(url, timeout=5)
         data = r.json()
         def_map = fetch_espn_defense_map()
         
-        # Normalize search key
-        search_key = my_team_abbrev.lower() # e.g. "bos"
-
         for event in data.get('events', []):
+            short_name = event.get('name', 'Unknown')
+            debug_games_found.append(short_name) 
+            
             comp = event['competitions'][0]
+            competitors = comp['competitors']
             
-            # Check competitors for our abbreviation
-            home_team = comp['competitors'][0]['team']
-            away_team = comp['competitors'][1]['team']
-            
-            h_abbrev = home_team.get('abbreviation', '').lower()
-            a_abbrev = away_team.get('abbreviation', '').lower()
-            
-            if search_key == h_abbrev or search_key == a_abbrev:
-                # Found Game!
-                date_obj = datetime.strptime(comp['date'], "%Y-%m-%dT%H:%M:%SZ")
-                if date_obj.date() < datetime.now().date(): continue # Skip finished games
+            # We check both teams in the matchup
+            for i, team_data in enumerate(competitors):
+                team = team_data['team']
+                t_abbrev = team.get('abbreviation', '').upper()
+                t_name = team.get('displayName', '').upper()
                 
-                is_home = (search_key == h_abbrev)
-                opp_team = away_team if is_home else home_team
-                opp_name = opp_team.get('displayName', 'Unknown')
+                # --- THE FUZZY MATCH ---
+                is_match = (t_abbrev == espn_abbrev) or (nickname in t_name)
                 
-                # Def Lookup
-                opp_ppg = def_map.get(opp_name.lower(), 114.5)
-                
-                return {
-                    'date': date_obj,
-                    'is_home': 1 if is_home else 0,
-                    'opp_name': opp_name,
-                    'opp_ppg': opp_ppg 
-                }
-    except: pass
+                if is_match:
+                    date_obj = datetime.strptime(comp['date'], "%Y-%m-%dT%H:%M:%SZ")
+                    
+                    if date_obj.date() < datetime.now().date(): continue 
+
+                    is_home = (team_data['homeAway'] == 'home')
+                    opp_idx = 1 - i
+                    opp_team = competitors[opp_idx]['team']
+                    opp_name = opp_team.get('displayName', 'Unknown')
+                    
+                    opp_ppg = def_map.get(opp_name.lower(), 114.5)
+                    
+                    return {
+                        'date': date_obj,
+                        'is_home': 1 if is_home else 0,
+                        'opp_name': opp_name,
+                        'opp_ppg': opp_ppg 
+                    }
+                    
+    except Exception as e:
+        st.error(f"ESPN Error: {e}")
+    
+    # --- DEBUG UI (Only shows if no game found) ---
+    with st.expander(f"🕵️ Debug: Why didn't we find {espn_abbrev}?"):
+        st.write(f"Searching for: **{espn_abbrev}** or **{nickname}**")
+        st.write("Games found in ESPN feed:")
+        st.write(debug_games_found)
+        
     return None
+
 
 # --- 2. LOGIC CLASS ---
 
