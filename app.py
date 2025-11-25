@@ -101,13 +101,12 @@ def normalize_abbrev(abbrev):
 
 def get_espn_schedule(my_team_abbrev):
     """
-    Finds games using a 'Fuzzy Search' to match BOS, Boston, or Celtics.
+    Finds games using a 'Fuzzy Search' and robust Time Parsing.
     """
     # 1. Setup Search Terms
     raw_abbrev = my_team_abbrev.upper().strip()
     espn_abbrev = normalize_abbrev(raw_abbrev)
     
-    # Common nicknames to ensure we find matches
     NICKNAMES = {
         'BOS': 'CELTICS', 'LAL': 'LAKERS', 'LAC': 'CLIPPERS', 'PHI': '76ERS', 'MIA': 'HEAT',
         'MIL': 'BUCKS', 'CHI': 'BULLS', 'TOR': 'RAPTORS', 'NYK': 'KNICKS', 'BKN': 'NETS',
@@ -148,8 +147,16 @@ def get_espn_schedule(my_team_abbrev):
                 is_match = (t_abbrev == espn_abbrev) or (nickname in t_name)
                 
                 if is_match:
-                    date_obj = datetime.strptime(comp['date'], "%Y-%m-%dT%H:%M:%SZ")
-                    
+                    # --- FIX: ROBUST TIME PARSING ---
+                    # ESPN sends '2025-11-26T22:00Z' (no seconds) or '...:00Z' (with seconds)
+                    d_str = comp['date'].replace('Z', '')
+                    try:
+                        # Try with seconds first
+                        date_obj = datetime.strptime(d_str, "%Y-%m-%dT%H:%M:%S")
+                    except ValueError:
+                        # Fallback to no seconds
+                        date_obj = datetime.strptime(d_str, "%Y-%m-%dT%H:%M")
+
                     if date_obj.date() < datetime.now().date(): continue 
 
                     is_home = (team_data['homeAway'] == 'home')
@@ -169,13 +176,13 @@ def get_espn_schedule(my_team_abbrev):
     except Exception as e:
         st.error(f"ESPN Error: {e}")
     
-    # --- DEBUG UI (Only shows if no game found) ---
     with st.expander(f"🕵️ Debug: Why didn't we find {espn_abbrev}?"):
         st.write(f"Searching for: **{espn_abbrev}** or **{nickname}**")
         st.write("Games found in ESPN feed:")
         st.write(debug_games_found)
         
     return None
+
 
 
 # --- 2. LOGIC CLASS ---
