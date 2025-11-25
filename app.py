@@ -9,16 +9,19 @@ from sklearn.ensemble import RandomForestRegressor
 from fake_useragent import UserAgent
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="NBA Prop Master Pro", page_icon="🚀", layout="wide")
+st.set_page_config(page_title="NBA Prop Master Pro", page_icon="🔥", layout="wide")
 
-# --- PROXY ROTATOR ---
-# We use a list of public proxies to bypass IP blocks
-# In a professional app, you would buy premium proxies. For now, we use a simple list.
-def get_proxies():
-    return {
-        "http": "",
-        "https": "",
-    }
+# --- API SETUP ---
+try:
+    from nba_api.stats.static import players, teams
+    from nba_api.stats.endpoints import (
+        playergamelog, scoreboardv2, leaguedashplayerstats, 
+        teamdashboardbygeneralsplits, playercareerstats, commonplayerinfo
+    )
+    API_STATUS = "Online"
+except ImportError:
+    API_STATUS = "Offline"
+    st.error("NBA API not found. Check requirements.txt")
 
 ua = UserAgent()
 def get_headers():
@@ -26,22 +29,8 @@ def get_headers():
         'User-Agent': ua.random,
         'Referer': 'https://www.nba.com/',
         'Origin': 'https://www.nba.com/',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'x-nba-stats-origin': 'stats',
-        'x-nba-stats-token': 'true'
+        'Accept-Language': 'en-US,en;q=0.9'
     }
-
-# --- API SETUP ---
-try:
-    from nba_api.stats.static import players
-    from nba_api.stats.endpoints import (
-        playergamelog, scoreboardv2, leaguedashplayerstats, 
-        teamdashboardbygeneralsplits, playercareerstats
-    )
-    API_STATUS = "Online"
-except ImportError:
-    API_STATUS = "Offline"
-    st.error("NBA API not found. Check requirements.txt")
 
 # --- 1. LIVE INDEX ---
 @st.cache_data(ttl=3600)
@@ -51,9 +40,9 @@ def build_player_index():
         dfs = pd.read_html(url)
         df = dfs[0]
         df = df[df['Player'] != 'Player']
-        
         player_map = {}
         
+        # Map Abbr to IDs
         team_map = {
             'ATL': 1610612737, 'BOS': 1610612738, 'CLE': 1610612739, 'NOP': 1610612740, 'CHI': 1610612741,
             'DAL': 1610612742, 'DEN': 1610612743, 'GSW': 1610612744, 'HOU': 1610612745, 'LAC': 1610612746,
@@ -83,10 +72,10 @@ def build_player_index():
 @st.cache_data(ttl=3600)
 def fetch_specific_team_defense(team_id):
     try:
-        time.sleep(random.uniform(0.5, 1.0))
+        time.sleep(0.2)
         stats = teamdashboardbygeneralsplits.TeamDashboardByGeneralSplits(
             team_id=team_id, measure_type_detailed_defense='Advanced',
-            season='2024-25', headers=get_headers(), timeout=10
+            season='2024-25', headers=get_headers(), timeout=5
         )
         return stats.get_data_frames()[0]['DEF_RATING'].iloc[0]
     except: return 114.5 
@@ -123,7 +112,6 @@ class NBAPredictorLogic:
     def train(self, player_name):
         if API_STATUS == "Offline": return None, None
         
-        # 1. Identification
         p_key = player_name.lower()
         if p_key in self.player_index:
             t_id = self.player_index[p_key]['team_id']
@@ -139,24 +127,14 @@ class NBAPredictorLogic:
             t_id = 0 
             pos_list = ['F'] 
 
-        # 2. Data Fetch with Retry
         with st.spinner(f"Scouting {player_name}..."):
             logs = []
             for season in ['2023-24', '2024-25']:
-                success = False
-                for attempt in range(3): # RETRY 3 TIMES
-                    try:
-                        time.sleep(random.uniform(0.5, 2.0)) # Random delay
-                        gamelog = playergamelog.PlayerGameLog(
-                            player_id=p_id, season=season, 
-                            headers=get_headers(), timeout=15
-                        )
-                        logs.append(gamelog.get_data_frames()[0])
-                        success = True
-                        break
-                    except: 
-                        time.sleep(1) # Wait 1s before retry
-                        continue
+                try:
+                    time.sleep(random.uniform(0.2, 0.6))
+                    gamelog = playergamelog.PlayerGameLog(player_id=p_id, season=season, headers=get_headers(), timeout=10)
+                    logs.append(gamelog.get_data_frames()[0])
+                except: pass
         
         if logs:
             self.safe_mode = False
@@ -195,7 +173,6 @@ class NBAPredictorLogic:
             
             return current_state, "Success"
         else:
-            # SAFE MODE
             self.safe_mode = True
             try:
                 career = playercareerstats.PlayerCareerStats(player_id=p_id, headers=get_headers())
@@ -213,8 +190,13 @@ class NBAPredictorLogic:
             return current_state, "Safe Mode"
 
     def get_next_game(self, team_id):
+        # --- OPTIMIZED SCHEDULE FETCH ---
+        # Instead of loop, try to hit the 'scoreboard' once or rely on ESPN backup
+        
         today = datetime.now()
-        for i in range(7):
+        
+        # 1. Try NBA Scoreboard (Just for today/tomorrow to save calls)
+        for i in range(2): 
             d_str = (today + timedelta(days=i)).strftime('%m/%d/%Y')
             try:
                 board = scoreboardv2.ScoreboardV2(game_date=d_str, headers=get_headers(), timeout=5)
@@ -236,6 +218,44 @@ class NBAPredictorLogic:
                         def_rtg = fetch_specific_team_defense(opp_id)
                         return {'date': today + timedelta(days=i), 'is_home': is_home, 'opp_id': opp_id, 'opp_name': opp_name, 'opp_def_rtg': def_rtg}
             except: continue
+            
+        # 2. Fallback: ESPN Schedule Scrape (Robust)
+        # If API fails/blocks or game is >2 days out
+        return self.fetch_schedule_backup(team_id)
+
+    def fetch_schedule_backup(self, team_id):
+        # Map ID to ESPN Slug
+        slug_map = {
+            1610612737: 'atl', 1610612738: 'bos', 1610612739: 'cle', 1610612740: 'no', 1610612741: 'chi',
+            1610612742: 'dal', 1610612743: 'den', 1610612744: 'gs', 1610612745: 'hou', 1610612746: 'lac',
+            1610612747: 'lal', 1610612748: 'mia', 1610612749: 'mil', 1610612750: 'min', 1610612751: 'bkn',
+            1610612752: 'ny', 1610612753: 'orl', 1610612754: 'ind', 1610612755: 'phi', 1610612756: 'phx',
+            1610612757: 'por', 1610612758: 'sac', 1610612759: 'sa', 1610612760: 'okc', 1610612761: 'tor',
+            1610612762: 'uta', 1610612763: 'mem', 1610612764: 'wsh', 1610612765: 'det', 1610612766: 'cha'
+        }
+        slug = slug_map.get(team_id, '')
+        if not slug: return None
+        
+        try:
+            url = f"https://www.espn.com/nba/team/schedule/_/name/{slug}"
+            dfs = pd.read_html(url)
+            for df in dfs:
+                if 'DATE' in df.columns and 'OPPONENT' in df.columns:
+                    for _, row in df.iterrows():
+                        # Find first non-result row (future game)
+                        if 'W' not in str(row['RESULT']) and 'L' not in str(row['RESULT']):
+                            opp_text = str(row['OPPONENT'])
+                            is_home = 'vs' in opp_text
+                            opp_clean = opp_text.replace('vs', '').replace('@', '').strip()
+                            # Return generic data if ESPN found
+                            return {
+                                'date': datetime.now() + timedelta(days=1), # Estimate
+                                'is_home': is_home,
+                                'opp_id': 0, 
+                                'opp_name': opp_clean,
+                                'opp_def_rtg': 114.5 # Fallback
+                            }
+        except: return None
         return None
 
     def check_teammates(self, team_id, my_player_name, injury_report):
@@ -256,6 +276,7 @@ class NBAPredictorLogic:
         except: return False, None, None
 
     def check_dynamic_defender(self, opp_team_id, my_positions, injury_report):
+        if opp_team_id == 0: return False, None, None, 0.0 # Skip if ID unknown
         try:
             stats = leaguedashplayerstats.LeagueDashPlayerStats(
                 team_id_nullable=opp_team_id, season='2024-25', 
@@ -287,18 +308,17 @@ class NBAPredictorLogic:
                         base_pen *= 0.7 
                     else:
                         match_type = "PRIMARY"
-                        
                     return True, def_name, f"{match_type} ({def_rtg})", base_pen
             return False, None, None, 0.0
         except: return False, None, None, 0.0
 
 # --- UI LAYOUT ---
-st.title("🚀 NBA Prop Master v30")
-st.caption("Full Automation | Anti-Block | Dynamic")
+st.title("🚀 NBA Prop Master v31")
+st.caption("Hybrid Schedule Engine")
 
 if 'data' not in st.session_state: st.session_state.data = None
 
-player_name = st.text_input("Player Name:", placeholder="e.g. Luka Doncic")
+player_name = st.text_input("Player Name:", placeholder="e.g. Jaylen Brown")
 
 if st.button("Analyze", type="primary"):
     if not player_name: st.warning("Enter name."); st.stop()
@@ -336,7 +356,7 @@ if st.session_state.data:
     next_game = d['next_game']
     predictor = d['predictor']
 
-    if not next_game: st.warning("No upcoming games."); st.stop()
+    if not next_game: st.warning("No upcoming games found."); st.stop()
 
     raw_rest = (next_game['date'] - state['last_date']).days - 1
     days_rest = 3 if raw_rest > 7 or raw_rest < 0 else raw_rest
