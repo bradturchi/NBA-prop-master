@@ -22,12 +22,16 @@ except ImportError:
 # --- 1. ROBUST DATA FETCHERS ---
 
 @st.cache_data(ttl=3600)
+# --- 1. ROBUST DATA FETCHERS (UPDATED FOR 2025-26 SEASON) ---
+
+@st.cache_data(ttl=3600)
 def fetch_team_defense_stats():
     """
     Scrapes 'Points Allowed Per Game' (PA/G) from Basketball-Reference Standings.
-    This is extremely robust because it reads the main standings table.
+    UPDATED: Now points to 2026 Season (Current).
     """
-    url = "https://www.basketball-reference.com/leagues/NBA_2025.html"
+    # CHANGE: 2025 -> 2026
+    url = "https://www.basketball-reference.com/leagues/NBA_2026.html"
     try:
         # Read all tables on the summary page
         dfs = pd.read_html(url)
@@ -35,18 +39,13 @@ def fetch_team_defense_stats():
         
         for df in dfs:
             # We look for tables that have "PA/G" (Points Allowed/Game)
-            # The standings tables (East/West) always have this column.
             if 'PA/G' in df.columns:
-                # The first column is always the Team Name (e.g. "Eastern Conference")
                 team_col = df.columns[0]
                 
                 for _, row in df.iterrows():
                     raw_team = str(row[team_col])
-                    
-                    # Skip headers like "Atlantic Division"
                     if "Division" in raw_team: continue
                     
-                    # Clean Name: "Boston Celtics*" -> "boston celtics"
                     clean_name = raw_team.replace("*", "").strip().lower()
                     
                     try:
@@ -61,9 +60,13 @@ def fetch_team_defense_stats():
 
 @st.cache_data(ttl=3600)
 def fetch_active_player_stats():
-    """Scrapes 2025 Player Per Game Stats."""
+    """
+    Scrapes Player Per Game Stats.
+    UPDATED: Now points to 2026 Season (Current).
+    """
+    # CHANGE: 2025 -> 2026
+    url = "https://www.basketball-reference.com/leagues/NBA_2026_per_game.html"
     try:
-        url = "https://www.basketball-reference.com/leagues/NBA_2025_per_game.html"
         dfs = pd.read_html(url)
         df = dfs[0]
         df = df[df['Player'] != 'Player']
@@ -84,6 +87,7 @@ def fetch_active_player_stats():
             except: continue
         return player_map
     except: return {}
+
 
 # --- 2. SCHEDULE ENGINE ---
 
