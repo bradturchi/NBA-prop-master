@@ -1,0 +1,9 @@
+streamlit
+pandas
+numpy
+scikit-learn
+nba_api
+lxml
+html5lib
+requests
+fake-useragent
