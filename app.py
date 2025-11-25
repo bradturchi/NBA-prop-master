@@ -7,8 +7,8 @@ from datetime import datetime, timedelta
 from sklearn.ensemble import RandomForestRegressor
 from fake_useragent import UserAgent
 
-# --- PAGE CONFIG ---
-st.set_page_config(page_title="NBA Prop Master Pro", page_icon="🧠", layout="wide")
+# --- CONFIGURATION ---
+st.set_page_config(page_title="NBA Prop Master Pro", page_icon="🏆", layout="wide")
 
 # --- API SETUP ---
 try:
@@ -31,16 +31,19 @@ def get_headers():
         'Accept-Language': 'en-US,en;q=0.9'
     }
 
-# --- 1. LIVE INDEX ---
+# --- 1. THE LIVE INDEX (Infrastructure) ---
 @st.cache_data(ttl=3600)
 def build_player_index():
+    """Scrapes Basketball Reference to build a live map of EVERY active player."""
     try:
         url = "https://www.basketball-reference.com/leagues/NBA_2025_per_game.html"
         dfs = pd.read_html(url)
         df = dfs[0]
-        df = df[df['Player'] != 'Player']
+        df = df[df['Player'] != 'Player'] 
         
         player_map = {}
+        
+        # Map Abbr to IDs
         team_map = {
             'ATL': 1610612737, 'BOS': 1610612738, 'CLE': 1610612739, 'NOP': 1610612740, 'CHI': 1610612741,
             'DAL': 1610612742, 'DEN': 1610612743, 'GSW': 1610612744, 'HOU': 1610612745, 'LAC': 1610612746,
@@ -110,17 +113,26 @@ class NBAPredictorLogic:
     def train(self, player_name):
         if API_STATUS == "Offline": return None, None
         
+        # --- 1. IDENTIFICATION ---
+        # Check Live Index first
         p_key = player_name.lower()
         if p_key in self.player_index:
             t_id = self.player_index[p_key]['team_id']
             pos_list = self.player_index[p_key]['pos']
-            
+            # Get standard ID
             nba_players = players.get_players()
             nba_p = next((p for p in nba_players if p['full_name'].lower() == p_key), None)
             p_id = nba_p['id'] if nba_p else 0
         else:
-            return None, "Player not found in index."
+            # Fallback to API search
+            nba_players = players.get_players()
+            nba_p = next((p for p in nba_players if p['full_name'].lower() == p_key), None)
+            if not nba_p: return None, "Player not found."
+            p_id = nba_p['id']
+            t_id = 0 
+            pos_list = ['F'] 
 
+        # --- 2. DATA FETCH ---
         with st.spinner(f"Scouting {player_name}..."):
             logs = []
             for season in ['2023-24', '2024-25']:
@@ -135,6 +147,11 @@ class NBAPredictorLogic:
             df = pd.concat(logs, ignore_index=True)
             df.columns = [c.upper() for c in df.columns]
             
+            # Self-Heal Team ID
+            if t_id == 0:
+                try: t_id = df['TEAM_ID'].iloc[0]
+                except: pass
+
             df['GAME_DATE'] = pd.to_datetime(df['GAME_DATE'])
             df = df.sort_values('GAME_DATE').reset_index(drop=True)
             df['days_rest'] = df['GAME_DATE'].diff().dt.days - 1
@@ -163,12 +180,14 @@ class NBAPredictorLogic:
             
             return current_state, "Success"
         else:
+            # SAFE MODE
             self.safe_mode = True
             try:
                 career = playercareerstats.PlayerCareerStats(player_id=p_id, headers=get_headers())
                 df = career.get_data_frames()[0].iloc[-1]
                 gp = df['GP'] if df['GP'] > 0 else 1
                 avgs = {'PTS': df['PTS']/gp, 'REB': df['REB']/gp, 'AST': df['AST']/gp}
+                if t_id == 0: t_id = df['TEAM_ID']
             except: return None, "API Blocked."
             
             current_state = {
@@ -221,70 +240,60 @@ class NBAPredictorLogic:
             return False, None, None
         except: return False, None, None
 
-    # --- 4. INTELLIGENT MATCHUP ENGINE ---
+    # --- 4. THE MATCHUP ENGINE (Logic from v26) ---
     def check_matchup_engine(self, opp_team_id, my_positions, injury_report):
         try:
-            # 1. Get Roster Stats
             stats = leaguedashplayerstats.LeagueDashPlayerStats(
                 team_id_nullable=opp_team_id, season='2024-25', 
                 measure_type_detailed_defense='Advanced', headers=get_headers(), timeout=5
             )
             df = stats.get_data_frames()[0]
             
-            # 2. Filter for Rotation Players (>20min) & Good Defense (<112 Rtg)
+            # Filter: Rotation (>20m) & Good Def (<112 Rtg)
             threats = df[(df['MIN'] > 20.0) & (df['DEF_RATING'] < 112.0)].sort_values('DEF_RATING')
             
             for _, row in threats.iterrows():
                 def_name = row['PLAYER_NAME']
                 def_rtg = row['DEF_RATING']
                 
-                # 3. Injury Check
                 status = check_player_status(injury_report, def_name)
                 if "out" in status: continue
                 
-                # 4. Position Match Logic
+                # Check Position Overlap
                 def_key = def_name.lower()
+                
+                # If not in index, assume Forward (safest)
+                def_pos = ['F']
                 if def_key in self.player_index:
                     def_pos = self.player_index[def_key]['pos']
+                
+                common = set(my_positions).intersection(def_pos)
+                
+                if common:
+                    # Found overlap
+                    base_pen = 0.0
                     
-                    # Check Intersection
-                    # my_positions = ['C', 'F'] (Wemby)
-                    # def_pos = ['C'] (Gobert) -> MATCH! (Primary)
-                    # def_pos = ['F'] (McDaniels) -> MATCH! (Switch)
+                    # Rating Scale
+                    if def_rtg < 106.0: base_pen = 0.08
+                    elif def_rtg < 110.0: base_pen = 0.05
+                    else: base_pen = 0.03
                     
-                    common = set(my_positions).intersection(def_pos)
-                    
-                    if common:
-                        # Calculate Weighted Penalty
-                        # Baseline Penalty
-                        base_pen = 0.0
+                    # Position Scale
+                    # If only 1 position matches and it's not the primary one, reduce penalty
+                    if len(common) < len(my_positions):
+                        match_type = "SWITCH"
+                        base_pen *= 0.7 
+                    else:
+                        match_type = "PRIMARY"
                         
-                        # Scale by Rtg: <106 is Elite (High Pen), <110 is Good (Med Pen)
-                        if def_rtg < 106.0: base_pen = 0.08 # 8%
-                        elif def_rtg < 110.0: base_pen = 0.05 # 5%
-                        else: base_pen = 0.03 # 3%
-                        
-                        # Scale by Position Match: Primary vs Switch
-                        # If they share the exact same primary role, full penalty.
-                        # If it's just a secondary overlap, reduce by 30%.
-                        
-                        # Heuristic: If more than 1 position overlaps, it's a Primary Match
-                        if len(common) > 1:
-                            match_type = "PRIMARY"
-                        elif list(common)[0] == my_positions[0]:
-                            match_type = "PRIMARY"
-                        else:
-                            match_type = "SWITCH"
-                            base_pen *= 0.7 # Reduce penalty for switch mismatch
-                            
-                        return True, def_name, f"{match_type} ({def_rtg})", base_pen
+                    return True, def_name, f"{match_type} ({def_rtg})", base_pen
             
             return False, None, None, 0.0
         except: return False, None, None, 0.0
 
 # --- UI LAYOUT ---
-st.title("💎 NBA Prop Master v26")
-st.caption("Intelligent Matchup Engine")
+st.title("💎 NBA Prop Master v29")
+st.caption("The Perfect Merge")
 
 if 'data' not in st.session_state: st.session_state.data = None
 
@@ -306,7 +315,7 @@ if st.button("Analyze", type="primary"):
         # Context
         is_tm_out, tm_name, tm_stat = predictor.check_teammates(state['team_id'], state['player_name'], injury_report)
         
-        # Dynamic Defense
+        # Dynamic Defense (Matchup Engine)
         is_def_active = False
         def_name, def_type, penalty_amt = None, None, 0.0
         if next_game:
