@@ -14,8 +14,8 @@ st.set_page_config(page_title="NBA Prop Master Pro", page_icon="🚀", layout="w
 try:
     from nba_api.stats.static import players, teams
     from nba_api.stats.endpoints import (
-        playergamelog, scoreboardv2, leaguedashplayerstats, 
-        teamdashboardbygeneralsplits, playercareerstats, commonplayerinfo
+        playergamelog, leaguedashplayerstats, 
+        teamdashboardbygeneralsplits, playercareerstats
     )
     API_STATUS = "Online"
 except ImportError:
@@ -84,7 +84,26 @@ def check_player_status(report, name):
         if name.lower() in key: return report[key]
     return "Active"
 
-# --- 3. MODELS & LOGIC ---
+# --- 3. SCHEDULE HELPERS (NEW) ---
+@st.cache_data
+def get_team_map():
+    """Creates a dictionary mapping Team Names to NBA API IDs."""
+    nba_teams = teams.get_teams()
+    # Maps "Boston Celtics" -> 1610612738
+    return {t['full_name'].lower(): t['id'] for t in nba_teams}
+
+@st.cache_data
+def load_schedule():
+    """Loads the hardcoded schedule from CSV."""
+    try:
+        # Expects a file named 'nba_schedule_2025.csv' with columns: Date, Visitor, Home
+        df = pd.read_csv("nba_schedule_2025.csv")
+        df['Date'] = pd.to_datetime(df['Date'])
+        return df
+    except FileNotFoundError:
+        return pd.DataFrame()
+
+# --- 4. MODELS & LOGIC ---
 @st.cache_resource
 def load_models():
     return {k: RandomForestRegressor(n_estimators=100, random_state=42) for k in ['PTS', 'REB', 'AST']}
@@ -110,7 +129,6 @@ class NBAPredictorLogic:
         pos_list = self.player_index.get(p_key, {}).get('pos', ['F'])
 
         # 2. Get Recent Logs (Last 2 Seasons)
-        # RETRY LOGIC for Cloud Stability
         logs = []
         for _ in range(3):
             try:
@@ -118,25 +136,23 @@ class NBAPredictorLogic:
                     time.sleep(random.uniform(0.5, 0.8)) 
                     gamelog = playergamelog.PlayerGameLog(player_id=p_id, season=season, headers=get_headers(), timeout=10)
                     logs.append(gamelog.get_data_frames()[0])
-                break # Success
+                break 
             except:
                 time.sleep(1)
                 continue
 
-        # 3. SUCCESS PATH (Game Logs Found)
+        # 3. SUCCESS PATH
         if logs and not any(l.empty for l in logs):
             self.safe_mode = False
             df = pd.concat(logs, ignore_index=True)
             df.columns = [c.upper() for c in df.columns]
             
-            # Identify Current Team
             try: t_id = df['TEAM_ID'].iloc[0]
             except: t_id = 0
 
             df['GAME_DATE'] = pd.to_datetime(df['GAME_DATE'])
             df = df.sort_values('GAME_DATE').reset_index(drop=True)
             
-            # Feature Engineering
             df['days_rest'] = df['GAME_DATE'].diff().dt.days - 1
             df['days_rest'] = df['days_rest'].fillna(3).clip(0, 7)
             df['is_home'] = df['MATCHUP'].apply(lambda x: 1 if 'vs.' in x else 0)
@@ -147,13 +163,11 @@ class NBAPredictorLogic:
             
             df['prev_game_min'] = df['MIN'].shift(1).fillna(32)
             
-            # Rolling Averages
             current_avgs = {}
             for stat in ['PTS', 'REB', 'AST']:
                 df[f'season_avg_{stat}'] = df[stat].expanding().mean().shift(1).fillna(df[stat].mean())
                 current_avgs[stat] = df[stat].tail(10).mean()
 
-            # Train Models
             clean_df = df.dropna()
             clean_df['opponent_def_rating'] = 114.5 
             
@@ -171,11 +185,10 @@ class NBAPredictorLogic:
             }
             return current_state, "Success"
 
-        # 4. SAFE MODE / FALLBACK (If logs are blocked)
+        # 4. SAFE MODE
         else:
             self.safe_mode = True
             try:
-                # Fallback to Career Stats (Often less strict than Game Logs)
                 career = playercareerstats.PlayerCareerStats(player_id=p_id, headers=get_headers())
                 df = career.get_data_frames()[0].iloc[-1]
                 
@@ -195,46 +208,64 @@ class NBAPredictorLogic:
                 return None, f"All APIs Blocked. Try running locally. ({str(e)})"
 
     def get_next_game(self, team_id):
-        """Scans the next 7 days via ScoreboardV2. Pure API, no scraping."""
-        today = datetime.now()
+        """
+        Scans the local CSV schedule (Robust).
+        Then uses API only for the Opponent's defensive stats (Dynamic).
+        """
+        schedule = load_schedule()
+        if schedule.empty:
+            st.error("❌ Schedule file 'nba_schedule_2025.csv' not found.")
+            return None
+
+        # Get the team name for the ID we are searching for (e.g., 1610612738 -> "Boston Celtics")
+        all_teams = teams.get_teams()
+        my_team_info = next((t for t in all_teams if t['id'] == team_id), None)
+        if not my_team_info: return None
         
-        for i in range(8):
-            check_date = today + timedelta(days=i)
-            d_str = check_date.strftime('%m/%d/%Y')
-            
-            try:
-                board = scoreboardv2.ScoreboardV2(game_date=d_str, headers=get_headers(), timeout=5)
-                # Access game_header safely
-                games = board.game_header.get_data_frame()
-                
-                if games.empty: continue
-                
-                # Filter for our team
-                my_game = games[(games['HOME_TEAM_ID'] == team_id) | (games['VISITOR_TEAM_ID'] == team_id)]
-                
-                if not my_game.empty:
-                    g = my_game.iloc[0]
-                    is_home = 1 if g['HOME_TEAM_ID'] == team_id else 0
-                    opp_id = g['VISITOR_TEAM_ID'] if is_home else g['HOME_TEAM_ID']
-                    
-                    # Get Opponent Name
-                    opp_info = teams.find_team_name_by_id(opp_id)
-                    opp_name = opp_info['nickname']
-                    
-                    # Fetch REAL TIME Opponent Defense
-                    def_rtg = fetch_specific_team_defense(opp_id)
-                    
-                    return {
-                        'date': check_date,
-                        'is_home': is_home,
-                        'opp_id': opp_id,
-                        'opp_name': opp_name,
-                        'opp_def_rtg': def_rtg
-                    }
-            except Exception as e:
-                continue 
-                
-        return None 
+        my_team_name = my_team_info['full_name'].lower()
+        
+        # Filter schedule for games in the next 7 days
+        today = pd.Timestamp.now().normalize()
+        end_date = today + pd.Timedelta(days=7)
+        
+        # Normalize strings for comparison
+        schedule['Visitor'] = schedule['Visitor'].astype(str).str.lower()
+        schedule['Home'] = schedule['Home'].astype(str).str.lower()
+        
+        # Find relevant games
+        mask = (
+            (schedule['Date'] >= today) & 
+            (schedule['Date'] <= end_date) & 
+            ((schedule['Visitor'] == my_team_name) | (schedule['Home'] == my_team_name))
+        )
+        
+        upcoming_games = schedule[mask].sort_values('Date')
+        
+        if upcoming_games.empty: return None
+        
+        # Pick the first game
+        game = upcoming_games.iloc[0]
+        
+        # Determine Opponent
+        is_home = (game['Home'] == my_team_name)
+        opp_name_str = game['Visitor'] if is_home else game['Home']
+        
+        # Map Opponent Name back to ID (Critical for Dynamic Defender logic)
+        team_map = get_team_map()
+        opp_id = team_map.get(opp_name_str, 0)
+        
+        # Fetch REAL TIME Opponent Defense (This keeps it dynamic!)
+        def_rtg = fetch_specific_team_defense(opp_id)
+        
+        display_opp_name = opp_name_str.title()
+
+        return {
+            'date': game['Date'],
+            'is_home': 1 if is_home else 0,
+            'opp_id': opp_id,
+            'opp_name': display_opp_name,
+            'opp_def_rtg': def_rtg
+        }
 
     def check_teammates(self, team_id, my_player_name, injury_report):
         try:
@@ -261,7 +292,7 @@ class NBAPredictorLogic:
             df = stats.get_data_frames()[0]
             
             # Filter: Regular rotation players (>24 mins)
-            rotation_players = df[df['MIN'] > 24.0].sort_values('DEF_RATING', ascending=True)
+            rotation_players = df[df['MIN'] > 20.0].sort_values('DEF_RATING', ascending=True)
             
             best_match = None
             
@@ -295,16 +326,15 @@ class NBAPredictorLogic:
                 name, m_type, rtg = best_match
                 # Calculate Penalty
                 base_pen = 0.10 if rtg < 108.0 else 0.05
-                # Reduced penalty for Switchable defenders
                 if m_type == "SWITCH": base_pen *= 0.6
                 return True, name, f"{m_type} ({rtg:.1f})", base_pen
                 
             return False, None, None, 0.0
         except: return False, None, None, 0.0
 
-# --- 4. UI LAYOUT ---
-st.title("🚀 NBA Prop Master v31")
-st.caption("Hybrid Schedule Engine")
+# --- 5. UI LAYOUT ---
+st.title("NBA Prop Master")
+st.caption("Scragglys betting buddy")
 
 if 'data' not in st.session_state: st.session_state.data = None
 
@@ -394,7 +424,6 @@ if st.session_state.data:
     st.subheader("🎯 Betting Recommendations")
     for stat in ['PTS', 'REB', 'AST']:
         if d['safe_mode']:
-            # Fallback calculation
             pred = state['avgs'][stat] * tm_mod * def_mod
             if days_rest == 0: pred *= 0.95
             if opp_rating < 110: pred *= 0.95
