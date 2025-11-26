@@ -119,9 +119,8 @@ def get_espn_schedule(my_team_abbrev):
     }
     nickname = NICKNAMES.get(espn_abbrev, "UNKNOWN")
 
-    # UPDATE: Start checking from YESTERDAY to detect Back-to-Backs
     today = datetime.now()
-    start_date = today - timedelta(days=1) # Look back 1 day
+    start_date = today - timedelta(days=1)
     end_date = today + timedelta(days=7)
     date_str = f"{start_date.strftime('%Y%m%d')}-{end_date.strftime('%Y%m%d')}"
     url = f"https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard?dates={date_str}&limit=100"
@@ -130,13 +129,10 @@ def get_espn_schedule(my_team_abbrev):
         r = requests.get(url, timeout=5)
         data = r.json()
         
-        # Load Stats Maps
         def_map = fetch_team_defense_stats()
         pace_map = fetch_pace_stats()
         
         my_games = []
-
-        # 1. Collect ALL games for my team in this window
         for event in data.get('events', []):
             comp = event['competitions'][0]
             for i, team_data in enumerate(comp['competitors']):
@@ -156,33 +152,24 @@ def get_espn_schedule(my_team_abbrev):
                         'date': date_obj,
                         'is_home': is_home,
                         'opp_name': opp_team.get('displayName', 'Unknown'),
-                        'opp_team': opp_team
                     })
 
-        # 2. Sort games by date
         my_games.sort(key=lambda x: x['date'])
         
-        # 3. Find the NEXT upcoming game
         next_game = None
         is_b2b = False
         
         for i, g in enumerate(my_games):
-            # If this game is in the future (or today)
             if g['date'].date() >= today.date():
                 next_game = g
-                
-                # CHECK B2B: Did we play the day before this game?
                 if i > 0:
                     prev_game = my_games[i-1]
-                    # If gap is 1 day, it's a B2B
                     if (g['date'].date() - prev_game['date'].date()).days == 1:
                         is_b2b = True
                 break
         
         if next_game:
-            # Stats Lookup
             opp_name = next_game['opp_name']
-            
             def find_stat(map_obj, default_val):
                 val = map_obj.get(opp_name.lower())
                 if not val:
@@ -224,6 +211,25 @@ class NBAPredictorLogic:
 
 # --- 4. UI LAYOUT ---
 st.title("📱 NBA Prop Master")
+
+# --- NEW: HOW IT WORKS DROPDOWN ---
+with st.expander("ℹ️ How to Use & Logic (Click to Open)"):
+    st.markdown("""
+    ### 📝 User Instructions
+    1.  **Enter Player Name:** Type the full name (e.g., *Jaylen Brown*) and press **Enter** or **Analyze**.
+    2.  **Review Factors:** Check the top dashboard for Opponent Strength, Pace, and Fatigue.
+    3.  **Check Projections:** Scroll down to see the projected stats (PTS, REB, AST).
+    4.  **Adjust the Line:** If your sportsbook has a different line (e.g., 24.5), type it into the "Line" box to see the new Edge rating.
+    
+    ### ⚙️ The "Quad-Factor" Engine
+    This app modifies a player's season average based on four live factors:
+    
+    * **🛡️ Opponent Defense:** If the opponent allows *more* points than average (114.5), we boost the projection.
+    * **⚡ Pace Factor:** If the opponent plays *faster* than average (100.0 possessions), we boost the projection (more opportunities).
+    * **🏠 Home Court:** Players typically perform **3% better** at home.
+    * **💤 Fatigue (Back-to-Back):** If the team played yesterday, we apply a **-5% penalty** for fatigue.
+    """)
+
 st.caption("Factors: Defense, Pace, Home/Away, Back-to-Back")
 
 if 'data' not in st.session_state: st.session_state.data = None
@@ -265,17 +271,9 @@ if st.session_state.data:
     st.divider()
     
     # --- PROJECTION MATH ---
-    # 1. Defense Impact
     def_factor = (opp_ppg - 114.5) / 114.5 
-    
-    # 2. Pace Impact
     pace_factor = (opp_pace - 100.0) / 100.0 
-    
-    # 3. Home/Away Impact
     home_factor = 0.03 if is_home else 0.0
-    
-    # 4. B2B Impact (New!)
-    # General rule: Players perform ~5% worse on zero days rest
     b2b_factor = -0.05 if is_b2b else 0.0
     
     total_boost = def_factor + pace_factor + home_factor + b2b_factor
