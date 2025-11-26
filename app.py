@@ -259,16 +259,26 @@ if st.session_state.data:
     is_home = game['is_home']
     is_b2b = game['is_b2b']
     
+        # ... (Keep existing setup code) ...
+    
     # Visuals
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Opponent", game['opp_name'], f"{'Home' if is_home else 'Away'}")
     c2.metric("Defense", f"{opp_ppg:.1f}", delta="High=Good" if opp_ppg > 115 else "Low=Bad")
     c3.metric("Pace", f"{opp_pace:.1f}", delta="Fast" if opp_pace > 100 else "Slow")
     
-    b2b_val = "Yes" if is_b2b else "No"
-    c4.metric("Back-to-Back?", b2b_val, delta="Tired" if is_b2b else "Fresh", delta_color="inverse")
+    # --- FIXED COLOR LOGIC ---
+    if is_b2b:
+        b2b_val = "Yes"
+        b2b_delta = "Tired (-5%)"
+        b2b_color = "inverse" # Red (Warning)
+    else:
+        b2b_val = "No"
+        b2b_delta = "Fresh"
+        b2b_color = "normal"  # Green (Good)
 
-    st.divider()
+    c4.metric("Back-to-Back?", b2b_val, delta=b2b_delta, delta_color=b2b_color)
+
     
     # --- PROJECTION MATH ---
     def_factor = (opp_ppg - 114.5) / 114.5 
