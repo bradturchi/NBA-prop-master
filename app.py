@@ -4,6 +4,7 @@ import numpy as np
 import time
 import random
 import requests
+import re  # Correctly placed import
 from datetime import datetime, timedelta
 from sklearn.ensemble import RandomForestRegressor
 from fake_useragent import UserAgent
@@ -22,54 +23,69 @@ except ImportError:
 # --- 1. ROBUST DATA FETCHERS ---
 
 @st.cache_data(ttl=3600)
-# --- 1. ROBUST DATA FETCHERS (UPDATED FOR 2025-26 SEASON) ---
-
-@st.cache_data(ttl=3600)
-import re # Add this import at the very top of your file if not there
-
-@st.cache_data(ttl=3600)
 def fetch_team_defense_stats():
     """
-    Scrapes 'Points Allowed Per Game' (PA/G) from Basketball-Reference.
-    UPDATED: Removes seeding numbers like '(1)' from team names.
+    Scrapes 'Opponent Points Per Game' from TeamRankings.com.
+    This is more reliable than B-Ref standings for simple PPG data.
     """
+    url = "https://www.teamrankings.com/nba/stat/opponent-points-per-game"
+    try:
+        # TeamRankings tables are clean and simple
+        dfs = pd.read_html(url)
+        df = dfs[0]
+        def_map = {}
+        
+        for _, row in df.iterrows():
+            # Team names are like "Boston" or "Okla City"
+            team_name = str(row['Team']).lower()
+            
+            # The column '2025' holds the current season stats (TeamRankings year naming convention)
+            # We look for the numeric column that represents the current season
+            # Usually the 3rd column (index 2) is the current season average
+            try:
+                ppg = float(row.iloc[2]) # Grab the current season value
+                
+                # Clean mappings
+                if "okla" in team_name: team_name = "oklahoma city thunder"
+                elif "la clippers" in team_name: team_name = "los angeles clippers"
+                elif "la lakers" in team_name: team_name = "los angeles lakers"
+                
+                def_map[team_name] = ppg
+                
+                # Also map common short names
+                if "boston" in team_name: def_map["celtics"] = ppg
+                if "golden" in team_name: def_map["warriors"] = ppg
+            except:
+                continue
+                
+        return def_map
+    except Exception as e:
+        # Fallback to B-Ref if TeamRankings fails
+        return fetch_defense_fallback()
+
+def fetch_defense_fallback():
+    """Backup scraper for B-Ref."""
     url = "https://www.basketball-reference.com/leagues/NBA_2026.html"
     try:
         dfs = pd.read_html(url)
         def_map = {}
-        
         for df in dfs:
-            # Look for the Standings Table (it has PA/G)
             if 'PA/G' in df.columns:
-                team_col = df.columns[0]
-                
                 for _, row in df.iterrows():
-                    raw_team = str(row[team_col])
+                    raw_team = str(row[df.columns[0]])
                     if "Division" in raw_team: continue
-                    
-                    # CLEANING: Remove "*" and "(1)" seed numbers
-                    # "Boston Celtics (2)" -> "Boston Celtics"
-                    clean_name = re.sub(r'\s*\(\d+\)', '', raw_team)
-                    clean_name = clean_name.replace("*", "").strip().lower()
-                    
-                    try:
-                        pag = float(row['PA/G'])
-                        def_map[clean_name] = pag
-                    except:
-                        continue
-                        
+                    clean_name = re.sub(r'\s*\(\d+\)', '', raw_team).replace("*", "").strip().lower()
+                    try: def_map[clean_name] = float(row['PA/G'])
+                    except: continue
         return def_map
-    except Exception as e:
-        return {}
-
+    except: return {}
 
 @st.cache_data(ttl=3600)
 def fetch_active_player_stats():
     """
     Scrapes Player Per Game Stats.
-    UPDATED: Now points to 2026 Season (Current).
+    Targeting 2026 Season (Current) to fix Jaylen Brown's PPG.
     """
-    # CHANGE: 2025 -> 2026
     url = "https://www.basketball-reference.com/leagues/NBA_2026_per_game.html"
     try:
         dfs = pd.read_html(url)
@@ -93,7 +109,6 @@ def fetch_active_player_stats():
         return player_map
     except: return {}
 
-
 # --- 2. SCHEDULE ENGINE ---
 
 ABBREV_MAP = {
@@ -105,7 +120,6 @@ def normalize_abbrev(abbrev):
     return ABBREV_MAP.get(clean, clean)
 
 def get_espn_schedule(my_team_abbrev):
-    # 1. Setup
     raw_abbrev = my_team_abbrev.upper().strip()
     espn_abbrev = normalize_abbrev(raw_abbrev)
     
@@ -119,7 +133,6 @@ def get_espn_schedule(my_team_abbrev):
     }
     nickname = NICKNAMES.get(espn_abbrev, "UNKNOWN")
 
-    # 2. Fetch
     today = datetime.now()
     end_date = today + timedelta(days=7)
     date_str = f"{today.strftime('%Y%m%d')}-{end_date.strftime('%Y%m%d')}"
@@ -128,16 +141,10 @@ def get_espn_schedule(my_team_abbrev):
     try:
         r = requests.get(url, timeout=5)
         data = r.json()
-        
-        # USE NEW DEFENSE SCRAPER
         def_map = fetch_team_defense_stats()
         
-        # DEBUG SIDEBAR (To verify data is loaded)
         if not def_map:
-            st.sidebar.error("❌ Stats Map Empty! B-Ref blocked?")
-        else:
-            st.sidebar.success(f"✅ Loaded Defense Stats for {len(def_map)} teams")
-            # st.sidebar.write(def_map) # Uncomment to see all teams
+            st.sidebar.error("⚠️ Defense stats not loaded.")
         
         for event in data.get('events', []):
             comp = event['competitions'][0]
@@ -146,7 +153,6 @@ def get_espn_schedule(my_team_abbrev):
                 t_name = team_data['team'].get('displayName', '').upper()
                 
                 if (t_abbrev == espn_abbrev) or (nickname in t_name):
-                    # Found Game
                     d_str = comp['date'].replace('Z', '')
                     try: date_obj = datetime.strptime(d_str, "%Y-%m-%dT%H:%M:%S")
                     except: date_obj = datetime.strptime(d_str, "%Y-%m-%dT%H:%M")
@@ -158,19 +164,18 @@ def get_espn_schedule(my_team_abbrev):
                     opp_team_data = comp['competitors'][opp_idx]['team']
                     opp_name = opp_team_data.get('displayName', 'Unknown')
                     
-                    # ROBUST LOOKUP
-                    # Try full name first: "boston celtics"
+                    # --- SMART LOOKUP ---
+                    # Try 1: Full match
                     opp_ppg = def_map.get(opp_name.lower())
                     
-                    # Try last word: "celtics"
+                    # Try 2: Partial match (e.g. "oklahoma city" in "oklahoma city thunder")
                     if not opp_ppg:
-                        opp_ppg = def_map.get(opp_name.split()[-1].lower())
-                        
-                    # Try short name: "celtics"
-                    if not opp_ppg:
-                        short = opp_team_data.get('shortDisplayName', '').lower()
-                        opp_ppg = def_map.get(short)
-
+                        for key in def_map:
+                            if key in opp_name.lower() or opp_name.lower() in key:
+                                opp_ppg = def_map[key]
+                                break
+                    
+                    # Try 3: Fallback to 114.5
                     if not opp_ppg: opp_ppg = 114.5
                     
                     return {
@@ -194,7 +199,6 @@ class NBAPredictorLogic:
     def train(self, player_name):
         p_key = player_name.lower().strip()
         
-        # Direct Backup Use (Since we know API is flaky)
         if p_key in self.player_stats_backup:
             stats = self.player_stats_backup[p_key]
             current_state = {
@@ -241,7 +245,6 @@ if st.session_state.data:
     game_date = next_game['date'].strftime("%a %b %d")
     opp_ppg = next_game['opp_ppg']
     
-    # 114.5 is rough league average
     if opp_ppg > 118: def_color = "green"
     elif opp_ppg < 110: def_color = "red"
     else: def_color = "gray"
