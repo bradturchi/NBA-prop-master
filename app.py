@@ -210,11 +210,13 @@ class NBAPredictorLogic:
         return None, "Player not found."
 
 # --- 4. UI LAYOUT ---
-st.title("📱 NBA Prop Master")
+st.title("NBA Player Performance Projections")
 
 # --- NEW: HOW IT WORKS DROPDOWN ---
-with st.expander("ℹ️ How to Use & Logic (Click to Open)"):
+with st.expander("ℹ️ About"):
     st.markdown("""
+    A cloud-native, mobile-first sports analytics tool designed to predict NBA player performance for prop betting.
+    
     ### 📝 User Instructions
     1.  **Enter Player Name:** Type the full name (e.g., *Jaylen Brown*) and press **Enter** or **Analyze**.
     2.  **Review Factors:** Check the top dashboard for Opponent Strength, Pace, and Fatigue.
