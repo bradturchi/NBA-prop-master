@@ -16,39 +16,25 @@ st.set_page_config(page_title="NBA Prop Master Mobile", page_icon="📱", layout
 
 @st.cache_data(ttl=3600)
 def fetch_pace_stats():
-    """
-    Scrapes 'Possessions Per Game' (Pace) from TeamRankings.
-    High Pace = More Opportunities = Over.
-    """
+    """Scrapes 'Possessions Per Game' (Pace) from TeamRankings."""
     url = "https://www.teamrankings.com/nba/stat/possessions-per-game"
     try:
         dfs = pd.read_html(url)
         df = dfs[0]
         pace_map = {}
-        
-        # Determine which column has current season data (usually index 2)
-        # We'll just grab the first numeric column after the team name
-        
         for _, row in df.iterrows():
             team_name = str(row['Team']).lower()
-            
-            # Clean weird TeamRankings names
             if "okla" in team_name: team_name = "oklahoma city thunder"
             elif "la clippers" in team_name: team_name = "los angeles clippers"
             elif "la lakers" in team_name: team_name = "los angeles lakers"
             elif "golden" in team_name: team_name = "golden state warriors"
             elif "washington" in team_name: team_name = "washington wizards"
-            
             try:
-                # Column 2 is usually current season (Rank, Team, 2026...)
-                pace = float(row.iloc[2])
+                pace = float(row.iloc[2]) # Current season is usually col 2
                 pace_map[team_name] = pace
-                
-                # Shortcuts
                 if "boston" in team_name: pace_map["celtics"] = pace
                 if "miami" in team_name: pace_map["heat"] = pace
             except: continue
-            
         return pace_map
     except: return {}
 
@@ -112,7 +98,7 @@ def fetch_active_player_stats():
         return player_map
     except: return {}
 
-# --- 2. SCHEDULE ENGINE ---
+# --- 2. SCHEDULE ENGINE (UPDATED FOR B2B) ---
 ABBREV_MAP = {'CHO': 'CHA', 'PHO': 'PHX', 'BRK': 'BKN', 'NOP': 'NO', 'SAS': 'SA', 'UTA': 'UTAH', 'WAS': 'WSH'}
 
 def normalize_abbrev(abbrev):
@@ -123,7 +109,6 @@ def get_espn_schedule(my_team_abbrev):
     raw_abbrev = my_team_abbrev.upper().strip()
     espn_abbrev = normalize_abbrev(raw_abbrev)
     
-    # Nickname Mapping
     NICKNAMES = {
         'BOS': 'CELTICS', 'LAL': 'LAKERS', 'LAC': 'CLIPPERS', 'PHI': '76ERS', 'MIA': 'HEAT',
         'MIL': 'BUCKS', 'CHI': 'BULLS', 'TOR': 'RAPTORS', 'NYK': 'KNICKS', 'BKN': 'NETS',
@@ -134,19 +119,24 @@ def get_espn_schedule(my_team_abbrev):
     }
     nickname = NICKNAMES.get(espn_abbrev, "UNKNOWN")
 
+    # UPDATE: Start checking from YESTERDAY to detect Back-to-Backs
     today = datetime.now()
+    start_date = today - timedelta(days=1) # Look back 1 day
     end_date = today + timedelta(days=7)
-    date_str = f"{today.strftime('%Y%m%d')}-{end_date.strftime('%Y%m%d')}"
+    date_str = f"{start_date.strftime('%Y%m%d')}-{end_date.strftime('%Y%m%d')}"
     url = f"https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard?dates={date_str}&limit=100"
     
     try:
         r = requests.get(url, timeout=5)
         data = r.json()
         
-        # Load Data Maps
+        # Load Stats Maps
         def_map = fetch_team_defense_stats()
         pace_map = fetch_pace_stats()
         
+        my_games = []
+
+        # 1. Collect ALL games for my team in this window
         for event in data.get('events', []):
             comp = event['competitions'][0]
             for i, team_data in enumerate(comp['competitors']):
@@ -157,29 +147,61 @@ def get_espn_schedule(my_team_abbrev):
                     d_str = comp['date'].replace('Z', '')
                     try: date_obj = datetime.strptime(d_str, "%Y-%m-%dT%H:%M:%S")
                     except: date_obj = datetime.strptime(d_str, "%Y-%m-%dT%H:%M")
-
-                    if date_obj.date() < datetime.now().date(): continue 
-
+                    
                     is_home = (team_data['homeAway'] == 'home')
                     opp_idx = 1 - i
                     opp_team = comp['competitors'][opp_idx]['team']
-                    opp_name = opp_team.get('displayName', 'Unknown')
                     
-                    # Smart Lookup for Stats
-                    def find_stat(map_obj, default_val):
-                        val = map_obj.get(opp_name.lower())
-                        if not val:
-                             for key in map_obj:
-                                if key in opp_name.lower(): return map_obj[key]
-                        return val if val else default_val
+                    my_games.append({
+                        'date': date_obj,
+                        'is_home': is_home,
+                        'opp_name': opp_team.get('displayName', 'Unknown'),
+                        'opp_team': opp_team
+                    })
 
-                    opp_ppg = find_stat(def_map, 114.5)
-                    opp_pace = find_stat(pace_map, 100.0)
-                    
-                    return {
-                        'date': date_obj, 'is_home': 1 if is_home else 0,
-                        'opp_name': opp_name, 'opp_ppg': opp_ppg, 'opp_pace': opp_pace
-                    }
+        # 2. Sort games by date
+        my_games.sort(key=lambda x: x['date'])
+        
+        # 3. Find the NEXT upcoming game
+        next_game = None
+        is_b2b = False
+        
+        for i, g in enumerate(my_games):
+            # If this game is in the future (or today)
+            if g['date'].date() >= today.date():
+                next_game = g
+                
+                # CHECK B2B: Did we play the day before this game?
+                if i > 0:
+                    prev_game = my_games[i-1]
+                    # If gap is 1 day, it's a B2B
+                    if (g['date'].date() - prev_game['date'].date()).days == 1:
+                        is_b2b = True
+                break
+        
+        if next_game:
+            # Stats Lookup
+            opp_name = next_game['opp_name']
+            
+            def find_stat(map_obj, default_val):
+                val = map_obj.get(opp_name.lower())
+                if not val:
+                        for key in map_obj:
+                            if key in opp_name.lower(): return map_obj[key]
+                return val if val else default_val
+
+            opp_ppg = find_stat(def_map, 114.5)
+            opp_pace = find_stat(pace_map, 100.0)
+            
+            return {
+                'date': next_game['date'], 
+                'is_home': 1 if next_game['is_home'] else 0,
+                'opp_name': opp_name, 
+                'opp_ppg': opp_ppg, 
+                'opp_pace': opp_pace,
+                'is_b2b': is_b2b
+            }
+            
     except: pass
     return None
 
@@ -202,7 +224,7 @@ class NBAPredictorLogic:
 
 # --- 4. UI LAYOUT ---
 st.title("📱 NBA Prop Master")
-st.caption("Updated: Pace & Home/Away Logic")
+st.caption("Factors: Defense, Pace, Home/Away, Back-to-Back")
 
 if 'data' not in st.session_state: st.session_state.data = None
 
@@ -229,41 +251,47 @@ if st.session_state.data:
     opp_ppg = game['opp_ppg']
     opp_pace = game['opp_pace']
     is_home = game['is_home']
+    is_b2b = game['is_b2b']
     
     # Visuals
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Opponent", game['opp_name'], f"{'Home' if is_home else 'Away'}")
-    c2.metric("Defense (PPG)", f"{opp_ppg:.1f}", delta="High=Good" if opp_ppg > 115 else "Low=Bad")
+    c2.metric("Defense", f"{opp_ppg:.1f}", delta="High=Good" if opp_ppg > 115 else "Low=Bad")
     c3.metric("Pace", f"{opp_pace:.1f}", delta="Fast" if opp_pace > 100 else "Slow")
+    
+    b2b_val = "Yes" if is_b2b else "No"
+    c4.metric("Back-to-Back?", b2b_val, delta="Tired" if is_b2b else "Fresh", delta_color="inverse")
 
     st.divider()
     
     # --- PROJECTION MATH ---
     # 1. Defense Impact
-    def_factor = (opp_ppg - 114.5) / 114.5  # +/- % based on points allowed
+    def_factor = (opp_ppg - 114.5) / 114.5 
     
-    # 2. Pace Impact (New!)
-    # League avg pace is roughly 100. If opp plays at 105, that's 5% more possessions.
+    # 2. Pace Impact
     pace_factor = (opp_pace - 100.0) / 100.0 
     
-    # 3. Home/Away Impact (New!)
+    # 3. Home/Away Impact
     home_factor = 0.03 if is_home else 0.0
     
-    total_boost = def_factor + pace_factor + home_factor
+    # 4. B2B Impact (New!)
+    # General rule: Players perform ~5% worse on zero days rest
+    b2b_factor = -0.05 if is_b2b else 0.0
+    
+    total_boost = def_factor + pace_factor + home_factor + b2b_factor
     
     st.subheader("📊 Factor Breakdown")
-    b_col1, b_col2, b_col3 = st.columns(3)
+    b_col1, b_col2, b_col3, b_col4 = st.columns(4)
     b_col1.info(f"Defense: {def_factor*100:+.1f}%")
     b_col2.warning(f"Pace: {pace_factor*100:+.1f}%")
     b_col3.success(f"Home: {home_factor*100:+.1f}%")
+    if is_b2b: b_col4.error(f"Fatigue: {b2b_factor*100:+.1f}%")
+    else: b_col4.caption("Fatigue: 0%")
     
     st.divider()
     
     for stat in ['PTS', 'REB', 'AST']:
         base = state['avgs'][stat]
-        
-        # Apply Boosts
-        # Defense affects all stats. Pace affects all stats. Home affects Role Players more (but we apply generally).
         pred = base * (1 + total_boost)
         
         with st.container():
