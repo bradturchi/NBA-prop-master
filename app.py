@@ -230,7 +230,7 @@ with st.expander("ℹ️ How to Use & Logic (Click to Open)"):
     * **💤 Fatigue (Back-to-Back):** If the team played yesterday, we apply a **-5% penalty** for fatigue.
     """)
 
-st.caption("Factors: Defense, Pace, Home/Away, Back-to-Back")
+st.caption("Scraggyly's betting buddy")
 
 if 'data' not in st.session_state: st.session_state.data = None
 
@@ -259,23 +259,31 @@ if st.session_state.data:
     is_home = game['is_home']
     is_b2b = game['is_b2b']
     
-        # ... (Keep existing setup code) ...
     
-    # Visuals
+    # --- VISUALS SECTION (UPDATED) ---
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Opponent", game['opp_name'], f"{'Home' if is_home else 'Away'}")
-    c2.metric("Defense", f"{opp_ppg:.1f}", delta="High=Good" if opp_ppg > 115 else "Low=Bad")
-    c3.metric("Pace", f"{opp_pace:.1f}", delta="Fast" if opp_pace > 100 else "Slow")
     
-    # --- FIXED COLOR LOGIC ---
+    # 1. DEFENSE FIX: Calculate difference from Avg (114.5)
+    # If Opp PPG is 112.6, diff is -1.9 -> Red Down Arrow (Correct for betting)
+    # If Opp PPG is 120.0, diff is +5.5 -> Green Up Arrow (Correct for betting)
+    def_diff = opp_ppg - 114.5
+    c2.metric("Defense (PPG)", f"{opp_ppg:.1f}", delta=f"{def_diff:.1f} vs Avg")
+    
+    # 2. PACE FIX: Calculate difference from Avg (100.0)
+    # Slower than avg (-2.0) = Red/Bad. Faster (+2.0) = Green/Good.
+    pace_diff = opp_pace - 100.0
+    c3.metric("Pace", f"{opp_pace:.1f}", delta=f"{pace_diff:.1f} vs Avg")
+    
+    # 3. B2B LOGIC (Keep existing logic)
     if is_b2b:
         b2b_val = "Yes"
         b2b_delta = "Tired (-5%)"
-        b2b_color = "inverse" # Red (Warning)
+        b2b_color = "inverse" # Red
     else:
         b2b_val = "No"
         b2b_delta = "Fresh"
-        b2b_color = "normal"  # Green (Good)
+        b2b_color = "normal"  # Green
 
     c4.metric("Back-to-Back?", b2b_val, delta=b2b_delta, delta_color=b2b_color)
 
